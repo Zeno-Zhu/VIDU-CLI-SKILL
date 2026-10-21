@@ -1,85 +1,76 @@
 # Vidu Q4 参数速查
 
-报错的时候先翻这里。
+报错的时候先翻这里。命令都是 `python scripts/vidu.py` 开头。
 
 ---
 
-## 三条命令
-
-### 提交
+## 命令
 
 ```bash
-vidu-cli task submit \
-  --type character2video \
-  --prompt "提示词" \
-  --image 图1.png --image 图2.png \
-  --duration 15 \
-  --model-version 3.4 \
-  --resolution 1080p \
-  --aspect-ratio 9:16 \
-  --schedule-mode nopeak
+# 查额度和积分
+python scripts/vidu.py check
+
+# 提交一条
+python scripts/vidu.py submit --prompt-file G01.txt \
+    --image 人物/男主.png --image 场景/饭馆.png \
+    --duration 10 --ratio 9:16
+
+# 批量（作业表见 SKILL.md 第六节）
+python scripts/vidu.py batch --jobs jobs.tsv
+
+# 查进度
+python scripts/vidu.py status
+
+# 下载
+python scripts/vidu.py pull --out ./out
+
+# 生图
+python scripts/vidu.py image --prompt "人物设定图：..." --name 男主 --ratio 9:16
 ```
 
-`--image` 可以重复，最多 9 张，顺序对应提示词里的 `[@图1]` `[@图2]`。
-
-### 查状态
-
-```bash
-vidu-cli task get <task_id>
-```
-
-### 下载
-
-```bash
-vidu-cli task get <task_id> --output ./out
-```
-
-下载成功会返回 `downloaded_files`，里面是本地路径。
+`--image` 可以重复，最多 9 张，**顺序对应【资产盘点】的 pn1 / pn2**。
 
 ---
 
 ## 任务类型
 
-| 类型 | 说明 | Q4 支持 |
-|---|---|---|
-| `character2video` | 参考生视频（图 + 主体） | ✅ 1–16 秒 |
-| `img2video` | 图生视频（一张图） | ✅ 3–16 秒 |
-| `text2video` | 纯文字生视频 | ❌ 不支持 |
-| `headtailimg2video` | 首尾帧 | ❌ 不支持 |
+| 类型 | 说明 | Q4 支持 | 时长 |
+|---|---|---|---|
+| `character2video` | 参考生视频（图 + 主体） | 是 | 1–16 秒 |
+| `img2video` | 图生视频（一张图） | 是 | 3–16 秒 |
+| `text2video` | 纯文字生视频 | **不支持** | — |
+| `headtailimg2video` | 首尾帧 | **不支持** | — |
+
+脚本的 `--type` 只开放了前两个。
 
 ---
 
 ## 参数
 
-| 参数 | 值 | 备注 |
+| 脚本参数 | 值 | 备注 |
 |---|---|---|
-| `--model-version` | `3.4` | Q4 |
 | `--duration` | 整数秒 | 参考生视频 1–16，图生视频 3–16 |
-| `--resolution` | `540p` `720p` `1080p` `2k` `4k` | 默认给 1080p |
-| `--aspect-ratio` | `16:9` `9:16` `1:1` `4:3` `3:4` | 竖屏给 9:16 |
-| `--schedule-mode` | `nopeak` `normal` | 闲时用 nopeak |
-| `--transition` | **不要传** | Q4 传了直接报错 |
+| `--ratio` | `16:9` `9:16` `1:1` `4:3` `3:4` | 竖屏给 9:16 |
+| `--mode` | `nopeak` / `normal` | 默认 nopeak（闲时） |
+| `--model` | 一般不用填 | 视频默认 3.4，生图默认 3.2_image_2_5_pro |
+
+分辨率固定 1080p，脚本里写死了，够用。
+
+**不要传 transition。** Q4 没这个参数，传了直接报错。脚本也没开放它。
 
 ---
 
 ## 闲时模式
 
-```bash
---schedule-mode nopeak
+```
+--mode nopeak
 ```
 
 - 每天 200 条，0 积分
 - 单条最长 16 秒
 - 同时最多 **100 条**在跑
-- 不带音频（带音频会 403）
-- **Q4 不写这个参数默认走 normal，扣积分**
-
-查额度：
-
-```bash
-vidu-cli task quota        # 闲时还能跑多少
-vidu-cli quota credit      # 积分余额
-```
+- 不带音频（带音频直接 403）
+- **默认就是 nopeak**；想花积分才显式写 `--mode normal`
 
 ---
 
@@ -89,7 +80,7 @@ vidu-cli quota credit      # 积分余额
 
 | state | 意思 |
 |---|---|
-| `created` `queueing` `preparation` `scheduling` `processing` | 还在跑，继续等 |
+| `created` `queueing` `preparation` `scheduling` `processing` | 还在跑 |
 | `success` | 成功，可以下载 |
 | `failed` | 失败，看 `err_code` / `err_msg` |
 | `canceled` | 取消 |
@@ -100,32 +91,27 @@ vidu-cli quota credit      # 积分余额
 
 | 报错 | 原因 | 改法 |
 |---|---|---|
-| `Q4 should not include transition` | 传了 transition | 去掉这个参数 |
-| `Q4 does not support claw_pass` | 用了通行证模式 | 改 `nopeak` 或 `normal` |
+| `Q4 should not include transition` | 传了 transition | 别传 |
+| `Q4 does not support claw_pass` | 模式用错 | 改 `nopeak` 或 `normal` |
 | `duration X out of range` | 时长超界 | 参考生视频 1–16，图生视频 3–16 |
-| `Q4 character2video requires an image, material or audio reference` | 没给素材 | 至少一张图 |
-| `withaudio & lipsync nopeak mode is not allowed` | 闲时带音频 | 去音频，或改 `normal` |
+| `Q4 character2video requires an image...` | 没给素材 | 至少一张图 |
+| `withaudio & lipsync nopeak mode is not allowed` | 闲时带了音频 | 去音频，或 `--mode normal` |
 | `Invalid resolution` | 分辨率写错 | 用 1080p |
-| `Invalid aspect_ratio` | 比例写错 | 从五个值里选 |
 | `INSUFFICIENT_CREDITS` | 积分不够 | 充值，或改走闲时 |
-| `CONTENT_MODERATION` | 内容审核没过 | 换说法，别写真实人名 |
+| `CONTENT_MODERATION` | 审核没过 | 换说法，别写真实人名 |
 | `INVALID_PROMPT_LENGTH` | 提示词太长 | 压到 2000 字内 |
+| `400 AuditSubmitIllegal` | 撞了敏感词 | 多半是角色名撞真人，换个名 |
 
 ---
 
-## 小技巧
+## 几个习惯
 
-**先查钱再提交**
+**先查额度再提交。** `check` 一眼就知道今天还能跑多少条。
 
-```bash
-vidu-cli task cost --type character2video --model-version 3.4 \
-  --duration 15 --resolution 1080p
-```
+**别一口气交超过 100 条。** 超了脚本会提醒你，硬交后面的会失败。
 
-返回 `cost_credits`，提交前心里有数。
+**下载用组号命名。** 脚本默认就是 `G01.mp4`，不用你改。
 
-**批量提交别写循环**，让 AI 来做：
+**崩了重跑同一条，别改提示词。** 改了就不是同一个镜头，后面接不上。
 
-> 把这 40 条按顺序提交，同时最多 100 个在跑，超了排队。每条提交完记下 task_id。
-
-**下载的文件名用镜头号**，别用 task_id。回头剪片子的时候你会感谢自己。
+**素材路径别用中文空格。** Windows 下带空格的路由容易出问题，文件夹名尽量短。

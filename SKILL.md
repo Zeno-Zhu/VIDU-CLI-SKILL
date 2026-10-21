@@ -12,26 +12,67 @@ description: 用 Vidu Q4 把一句话变成能发的视频。做漫剧、卖货�
 
 ---
 
-## 零、开工前先自检
+## 零、开工前自检（你自己做，别让用户动手）
 
-第一次用，先跑一句：
+**不要让用户点任何文件、敲任何命令。** 你自己查、自己装、自己配。
+
+### 第 1 步：查 Python
 
 ```bash
-vidu-cli quota credit
+python --version
 ```
 
-| 返回什么 | 说明 | 怎么办 |
+不行就依次试 `py --version`、`python3 --version`。
+
+**一个都没有，你自己装：**
+
+```bash
+# 机器上有 winget 的话，一条命令
+winget install -e --id Python.Python.3.12 --accept-source-agreements --accept-package-agreements
+```
+
+没有 winget 就下官方安装包静默装：
+
+```bash
+curl -L -o "%TEMP%\py-setup.exe" https://www.python.org/ftp/python/3.12.8/python-3.12.8-amd64.exe
+"%TEMP%\py-setup.exe" /quiet InstallAllUsers=0 PrependPath=1 Include_pip=1
+```
+
+⚠ **装完当前窗口还是找不到 `python`**（PATH 没刷新），这是正常的。别让用户重开，直接用绝对路径：
+
+```
+%LOCALAPPDATA%\Programs\Python\Python312\python.exe
+```
+
+再找不到就去 `C://Program Files\Python312\` 底下翻。
+
+### 第 2 步：跑自检
+
+```bash
+python scripts/init_env.py --check
+```
+
+| 返回 | 意思 | 你该做什么 |
 |---|---|---|
-| 有 `credits` 数字 | 都好了 | **直接开工，一个字都别再问用户** |
-| `command not found` | 没装 CLI | 走第三节的安装引导 |
-| 报 token / 401 / unauthorized | 没配 Token | 只引导 Token，别重复问别的 |
+| `0` | 环境齐了 | **直接开工，别再问用户任何环境问题** |
+| `2` | 缺 Token | 只问 Token，别的一概不问 |
 
-**用户已经配好的，别再让人配一遍。** 反复问 Token 是最烦人的。
+### 第 3 步：配 Token（只在返回 2 时做）
 
-第一次要 Token 时，把这段给他：
+只问这一句，别啰嗦：
 
-> 打开 vidu.cn，点左下角头像，找「Vidu Token」，复制那一串。
-> 只贴在你自己的电脑上，别发群里。
+> 打开 vidu.cn，点左下角头像，找「Vidu Token」，复制那一串发我。
+> 只贴给我，别发群里。
+
+拿到后：
+
+```bash
+python scripts/init_env.py --token <他给的那串>
+```
+
+跑完会打印额度和积分，让他看一眼，确认通了再往下。
+
+**Token 存在 `~/.vidu-cli-skill/token.txt`**，不在 skill 目录里——skill 目录会被 `git pull` 覆盖，那边存不住。
 
 ---
 
@@ -123,29 +164,7 @@ vidu-cli quota credit
 
 ---
 
-## 三、装工具（第一次用才需要）
-
-把这段给他，让他自己贴给 AI，或者你直接执行：
-
-```
-帮我装一下 Vidu 的 CLI，仓库在这：
-https://github.com/shengshu-ai/vidu-cli
-
-我不懂代码，环境你看着办，按仓库里的说明装。
-要 Token 的时候，让我自己在你界面上填，别让我发给你。
-装完跑一下 vidu-cli quota credit，能查到余额就算成了。
-
-视频用 Q4，闲时任务带 --schedule-mode nopeak。
-生图模型用 3.2_image_2_5_pro。
-```
-
-Token 在 [vidu.cn](https://www.vidu.cn) 左下角头像 → **Vidu Token**。
-
-⚠ 提醒他一句：Token 只在自己电脑上填，别发群里。
-
----
-
-## 四、两条线的流程
+## 三、两条线的流程
 
 ### 漫剧线：先有图，再出片
 
@@ -182,7 +201,7 @@ Token 在 [vidu.cn](https://www.vidu.cn) 左下角头像 → **Vidu Token**。
 
 ---
 
-## 五、Vidu Q4 的硬规矩
+## 四、Vidu Q4 的硬规矩
 
 | 项 | 值 |
 |---|---|
@@ -198,7 +217,7 @@ Token 在 [vidu.cn](https://www.vidu.cn) 左下角头像 → **Vidu Token**。
 
 ---
 
-## 六、提交：闲时免费，但要管并发
+## 五、提交：闲时免费，但要管并发
 
 **闲时额度每天 200 条，0 积分，单条最长 16 秒。**
 
@@ -224,37 +243,48 @@ Token 在 [vidu.cn](https://www.vidu.cn) 左下角头像 → **Vidu Token**。
 
 ---
 
-## 七、三条命令
+## 六、命令
+
+全是 `python scripts/vidu.py` 开头，**不用装任何第三方包**。
 
 ```bash
-# 提交
-vidu-cli task submit --type character2video \
-  --prompt "提示词" --image 图1.png \
-  --duration 15 --model-version 3.4 \
-  --resolution 1080p --aspect-ratio 9:16 \
-  --schedule-mode nopeak
+# 查额度（开工前先看一眼）
+python scripts/vidu.py check
 
-# 查
-vidu-cli task get <task_id>
+# 提交一条
+python scripts/vidu.py submit --prompt-file G01.txt --image 人物/男主.png --image 场景/饭馆.png --duration 10
 
-# 下载
-vidu-cli task get <task_id> --output ./out
+# 批量提交
+python scripts/vidu.py batch --jobs jobs.tsv
+
+# 查进度
+python scripts/vidu.py status
+
+# 下载成品
+python scripts/vidu.py pull --out ./out
+
+# 生图（做资产图用）
+python scripts/vidu.py image --prompt "人物设定图：..." --name 男主
 ```
 
-也可以用 `scripts/vidu.py` 批量做：
+**作业表 `jobs.tsv`** —— 每行一条，制表符分隔，四列：
 
-```bash
-python scripts/vidu.py quota
-python scripts/vidu.py submit --jobs jobs.tsv --out ./out
-python scripts/vidu.py status --ledger ./out/_台账.json
-python scripts/vidu.py pull   --ledger ./out/_台账.json --out ./out
+```
+G01	prompts/G01.txt	人物/男主.png,场景/饭馆.png	10
+G02	prompts/G02.txt	人物/男主.png,场景/饭馆.png	12
 ```
 
-**每条提交完，把镜头号和 task_id 记下来。** 别让用户对着 task_id 猜哪个是第 7 个镜头。
+组号 / 提示词文件 / 图片（逗号分隔） / 时长
+
+⚠ **`--image` 的顺序必须和【资产盘点】里的 pn1、pn2 对上。** 顺序错了就换脸。
+
+每条提交完自动写台账（`out/_台账.json`），断了能续，下载按组号命名，不用你对着 task_id 猜。
+
+**提交完别坐着等。** 一次交完，隔几分钟 `status` 看一眼，好了的 `pull` 下来。
 
 ---
 
-## 八、提示词写不对，帮他改
+## 七、提示词写不对，帮他改
 
 用户自己写的提示词，十有八九是「画面很有氛围感」这种。
 
@@ -266,7 +296,7 @@ python scripts/vidu.py pull   --ledger ./out/_台账.json --out ./out
 
 ---
 
-## 九、报错怎么办
+## 八、报错怎么办
 
 | 报错 | 改法 |
 |---|---|
@@ -281,7 +311,7 @@ python scripts/vidu.py pull   --ledger ./out/_台账.json --out ./out
 
 ---
 
-## 十、这套东西不做什么
+## 九、这套东西不做什么
 
 跟用户讲清楚，省得他以为是万能的：
 
@@ -292,7 +322,7 @@ python scripts/vidu.py pull   --ledger ./out/_台账.json --out ./out
 
 ---
 
-## 十一、干活时的几条习惯
+## 十、干活时的几条习惯
 
 1. **先给表，再写词。** 分镜没点头就写提示词，白干。
 2. **一次交付一块。** 别一口气吐 40 条提示词，用户看不完。
