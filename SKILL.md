@@ -64,6 +64,11 @@ python scripts/init_env.py --check
 > 打开 vidu.cn，点左下角头像，找「Vidu Token」，复制那一串发我。
 > 只贴给我，别发群里。
 
+**他要是说找不到，直接把这张图发给他看**：`assets/vidu-token.png`
+
+发图，别用文字形容位置（"左边第三个菜单"这种说法，他更找不着）。
+图里红框圈的就是：左下角头像 → 菜单第二项 `<> Vidu Token`。
+
 拿到后：
 
 ```bash

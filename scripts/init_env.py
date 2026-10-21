@@ -104,6 +104,8 @@ def main():
         say("        2. 点左下角头像 → Vidu Token")
         say("        3. 复制那一串（vda_ 开头）")
         say("")
+        say("      找不到的话，看这张图：assets\\vidu-token.png")
+        say("")
         say("      ⚠ 这一串等于钱包密码，别发群里、别截图给别人。")
         say("")
         try:

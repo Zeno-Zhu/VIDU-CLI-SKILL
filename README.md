@@ -42,9 +42,8 @@
    机器上没 Python 就你自己装，winget 或者官方安装包静默装都行，
    别让我动手，也别让我去点 .cmd。
 
-4. 缺 Token 再来问我，别一上来就要。
-
-装完告诉我一句：额度多少。
+4. 引导我打开 vidu.cn，点左下角头像，找到「Vidu Token」，复制发给你。
+   我要是找不到，把 assets/vidu-token.png 发给我看。
 ````
 
 拉不下来的话，换成 SSH 地址或者镜像再试，别卡在这一步。
@@ -162,6 +161,7 @@ references/提示词自检表.md      提示词合不合规，对着改
 references/vidu-q4-参数.md      参数细节，报错时查
 scripts/vidu.py               内置客户端：提交 / 查询 / 下载 / 生图
 scripts/init_env.py           环境检查（cmd 里调的就是它）
+assets/vidu-token.png         找 Token 的位置截图（找不到时 AI 会发给你）
 ```
 
 ---
