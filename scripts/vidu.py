@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """vidu.py —— 内置的 Vidu 客户端（纯 Python，不需要 Node / npm）。
 
-只做几件事：查额度、提交、查进度、下载，外加生图。
+只做几件事：查额度、提交、查进度、下载，外加生图、做符、管符库。
 **它不是调度器**，排队补位这些交给 AI 做。
 
     python scripts/vidu.py check
@@ -10,6 +10,9 @@
     python scripts/vidu.py status
     python scripts/vidu.py pull --out ./out
     python scripts/vidu.py image --prompt "人物设定图：..." --name 男主
+    python scripts/vidu.py card --name 太极拳 --prompt-file out/符/符-太极拳/prompt.txt
+    python scripts/vidu.py lib
+    python scripts/vidu.py lib --q 太极 --show 符-太极拳
 
 Token 从四个地方找，先找到先用：
     1. 环境变量 VIDU_TOKEN
@@ -413,36 +416,314 @@ def cmd_pull(a):
 
 
 def cmd_image(a):
-    api = API()
+    text = _read_prompt(a)
     os.makedirs(a.out, exist_ok=True)
-    job = {"id": a.name or "img", "prompt": a.prompt,
-           "type": "reference2image" if a.ref else "text2image",
-           "ratio": a.ratio, "images": a.ref or [], "model": a.model}
-    payload = build_payload(job, api, "normal", {})
+    name = a.name or "img"
     if a.dry_run:
-        print("[dry]", json.dumps(payload["settings"], ensure_ascii=False))
+        print("[dry] %s ｜ %d 字 ｜ → %s"
+              % (a.ratio, len(text), os.path.join(a.out, name + ".png")))
         return 0
+    api = API()
+    job = {"id": name, "prompt": text,
+           "type": "reference2image" if a.ref else "text2image",
+           "ratio": a.ratio, "images": a.ref or [], "model": a.model,
+           "resolution": a.resolution}
+    payload = build_payload(job, api, "normal", {})
+    _warn_long(text)
     r = api.submit(payload)
     tid = str(r.get("id"))
     print("生图任务 %s，等它出…" % tid)
-    d = {}
-    for _ in range(60):
-        d = api.task(tid)
-        if d.get("state") in DONE:
-            break
-        time.sleep(3)
+    d = _wait_image(api, tid, a.wait)
     if d.get("state") != "success":
         print("失败：%s %s" % (d.get("err_code"), d.get("err_msg")))
         return 1
+    dest = os.path.join(a.out, name + ".png")
+    if not _save_image(api, tid, dest):
+        return 1
+    print("存好了：%s（%d KB）" % (dest, os.path.getsize(dest) // 1024))
+    return 0
+
+
+def cmd_card(a):
+    """符：16:9 能力面板。一张图讲清一个 AI 视频能力。"""
+    text = _read_prompt(a)
+    raw = (a.name or "").strip() or time.strftime("符-%m%d-%H%M")
+    name = _slug(raw)
+    if not name.startswith("符"):
+        name = "符-" + name
+    out = a.out or os.path.join(ROOT, "out", "符", name)
+
+    if a.dry_run:
+        print("[dry] %s ｜ %d 字 ｜ → %s"
+              % (a.ratio, len(text), os.path.join(out, "panel.png")))
+        print(text[:160].replace("\n", " "))
+        return 0
+
+    os.makedirs(out, exist_ok=True)
+    api = API()
+    job = {"id": name, "prompt": text,
+           "type": "reference2image" if a.ref else "text2image",
+           "ratio": a.ratio, "images": a.ref or [], "model": a.model,
+           "resolution": a.resolution}
+    payload = build_payload(job, api, "normal", {})
+
+    _warn_long(text)
+    # 存一份实际用的提示词，改字重跑时直接改它
+    open(os.path.join(out, "prompt.txt"), "w", encoding="utf-8").write(text)
+
+    r = api.submit(payload)
+    tid = str(r.get("id"))
+    print("生图任务 %s，等它出…" % tid)
+    d = _wait_image(api, tid, a.wait)
+    if d.get("state") != "success":
+        print("失败：%s %s" % (d.get("err_code"), d.get("err_msg")))
+        return 1
+    dest = os.path.join(out, "panel.png")
+    if not _save_image(api, tid, dest):
+        return 1
+    print("符出好了：%s（%d KB）" % (dest, os.path.getsize(dest) // 1024))
+    print("错字就改 %s 再跑一遍，别重画整段。" % os.path.join(out, "prompt.txt"))
+
+    if not a.no_lib:
+        if a.meta:
+            meta = dict(_read_meta(a.meta))
+        else:
+            mp = os.path.join(out, "meta.json")
+            meta = dict(_read_meta(mp)) if os.path.isfile(mp) else {}
+        if a.meta and os.path.abspath(a.meta) != os.path.abspath(os.path.join(out, "meta.json")):
+            with open(os.path.join(out, "meta.json"), "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=1)
+        if a.tag:
+            meta["tags"] = a.tag
+        n = upsert_card(_card_entry(out, meta))
+        print("入库：%s ｜ 库里现在 %d 张，`lib` 可以看" % (meta.get("name") or name, n))
+        if not meta:
+            print("   ⚠ 没给 --meta，这张符在库里只有名字，没有「管什么 / 何时调」。"
+                  "补一个：lib --add %s" % out)
+    return 0
+
+
+def _read_prompt(a):
+    text = (getattr(a, "prompt", "") or "").strip()
+    if not text and getattr(a, "prompt_file", ""):
+        if not os.path.isfile(a.prompt_file):
+            sys.exit("找不到提示词文件：%s" % a.prompt_file)
+        text = open(a.prompt_file, encoding="utf-8").read().strip()
+    if not text:
+        sys.exit("需要 --prompt 或 --prompt-file")
+    return text
+
+
+def _slug(s):
+    bad = '\\/:*?"<>|\n\r\t'
+    s = "".join(("_" if c in bad else c) for c in s).strip().strip(".")
+    return s or "符"
+
+
+def _warn_long(text):
+    if len(text) > 2000:
+        print("⚠ 提示词 %d 字，超过 2000 字容易被拒，或者模型只记住前半段。"
+              "压到 1500 字内再跑。" % len(text))
+
+
+def _wait_image(api, tid, limit):
+    d, t0 = {}, time.time()
+    while time.time() - t0 < limit:
+        d = api.task(tid)
+        if d.get("state") in DONE:
+            return d
+        time.sleep(3)
+    print("等了 %d 秒还没出完，拿 task_id 去 vidu.cn 上看：%s" % (limit, tid))
+    return d
+
+
+def _save_image(api, tid, dest):
     cs = api.creations(tid)
     url = next((str(c[k]) for c in cs for k in ("download_uri", "nomark_uri", "uri")
                 if c.get(k)), None)
     if not url:
         print("没拿到图片地址")
-        return 1
-    dest = os.path.join(a.out, (a.name or tid) + ".png")
-    api.download(url, dest)
-    print("存好了：%s" % dest)
+        return None
+    try:
+        api.download(url, dest)
+    except Exception as e:
+        print("下载失败：%s" % e)
+        return None
+    return dest
+
+
+# ─────────────────────── 符库 ───────────────────────
+# 一张符 = 一个文件夹 + 一条索引。索引是纯 JSON，手改也行，改完别动 id。
+# 默认跟着脚本走：skill 装在哪，库就在哪。有两份 skill 想共用一个库，设 VIDU_CARD_ROOT。
+CARD_ROOT = os.environ.get("VIDU_CARD_ROOT") or os.path.join(ROOT, "out", "符")
+LIB = os.path.join(CARD_ROOT, "_库.json")
+
+
+def load_lib():
+    if os.path.isfile(LIB):
+        try:
+            j = json.load(open(LIB, encoding="utf-8-sig"))
+            if isinstance(j, dict) and isinstance(j.get("cards"), list):
+                return j
+        except Exception:
+            print("⚠ 符库索引坏了（%s），这次先当空库用，别急着重写它" % LIB)
+    return {"version": 1, "cards": []}
+
+
+def save_lib(lib):
+    os.makedirs(CARD_ROOT, exist_ok=True)
+    lib["version"] = 1
+    lib["updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    with open(LIB, "w", encoding="utf-8") as f:
+        json.dump(lib, f, ensure_ascii=False, indent=1)
+
+
+def _rel(p):
+    try:
+        return os.path.relpath(p, CARD_ROOT).replace("\\", "/")
+    except Exception:
+        return p
+
+
+def _read_meta(path):
+    if not path or not os.path.isfile(path):
+        if path:
+            print("⚠ 找不到 meta：%s，按文件夹名入库" % path)
+        return {}
+    try:
+        j = json.load(open(path, encoding="utf-8-sig"))
+        return j if isinstance(j, dict) else {}
+    except Exception as e:
+        print("⚠ meta 不是合法 JSON（%s），按文件夹名入库" % e)
+        return {}
+
+
+def _tags(v):
+    """标签手写成字符串也行：「动作, 教学」或「动作、教学」都认。"""
+    if isinstance(v, str):
+        s = v
+        for ch in (",", "，", "、", "/", "|", ";"):
+            s = s.replace(ch, " ")
+        v = s.split()
+    return [str(t).strip() for t in (v or []) if str(t).strip()]
+
+
+def _card_entry(folder, meta):
+    """meta 就是符系统第一个代码块：name / type / intro / prompt。"""
+    cid = _slug(os.path.basename(os.path.normpath(folder)))
+    return {
+        "id": cid,
+        "name": (meta.get("name") or cid).strip(),
+        "type": (meta.get("type") or "未分类").strip(),
+        "intro": (meta.get("intro") or "").strip(),
+        "call": (meta.get("prompt") or "").strip(),
+        "tags": _tags(meta.get("tags")),
+        "file": _rel(os.path.join(folder, "panel.png")),
+        "created": time.strftime("%Y-%m-%d"),
+    }
+
+
+def upsert_card(entry):
+    lib = load_lib()
+    old = next((c for c in lib["cards"] if c.get("id") == entry["id"]), {})
+    if old.get("created"):
+        entry["created"] = old["created"]
+    if old.get("tags") and not entry["tags"]:
+        entry["tags"] = old["tags"]
+    lib["cards"] = [c for c in lib["cards"] if c.get("id") != entry["id"]]
+    lib["cards"].append(entry)
+    lib["cards"].sort(key=lambda c: (c.get("created") or "", c.get("id") or ""), reverse=True)
+    save_lib(lib)
+    return len(lib["cards"])
+
+
+def _clip(s, n):
+    s = (s or "").replace("\n", " ").strip()
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+def cmd_lib(a):
+    lib = load_lib()
+
+    if a.rm:
+        hit = [c for c in lib["cards"] if a.rm in (c.get("id"), c.get("name"))]
+        if not hit:
+            sys.exit("库里没这个符：%s" % a.rm)
+        for c in hit:
+            print("移出库：%s（图没删，还在 out/符/%s）"
+                  % (c.get("name"), os.path.dirname(c.get("file") or "")))
+        lib["cards"] = [c for c in lib["cards"] if c not in hit]
+        save_lib(lib)
+        print("库里现在 %d 张。" % len(lib["cards"]))
+        return 0
+
+    if a.add:
+        p = os.path.abspath(a.add)
+        folder = os.path.dirname(p) if os.path.isfile(p) else p
+        if not os.path.isdir(folder):
+            sys.exit("找不到目录：%s" % folder)
+        if not os.path.isfile(os.path.join(folder, "panel.png")):
+            print("⚠ 这个目录里没有 panel.png，入库了也用不了，先确认图在哪")
+        mp = os.path.join(folder, "meta.json")
+        meta = _read_meta(mp) if os.path.isfile(mp) else {}
+        if a.tag:
+            meta["tags"] = a.tag
+        e = _card_entry(folder, meta)
+        if e["file"].startswith(".."):
+            print("⚠ 这张符不在 out/符 底下，库只记了个相对路径，换台机器就找不着了")
+        n = upsert_card(e)
+        print("补录：%s ｜ 库里现在 %d 张" % (e["name"], n))
+        return 0
+
+    cards = lib["cards"]
+    q = (a.q or "").strip().lower()
+    if q:
+        cards = [c for c in cards if q in json.dumps(c, ensure_ascii=False).lower()]
+    if a.tag:
+        want = [t.lower() for t in a.tag]
+        cards = [c for c in cards
+                 if all(t in [str(x).lower() for x in (c.get("tags") or [])] for t in want)]
+
+    if a.show:
+        c = next((x for x in lib["cards"]
+                  if a.show in (x.get("id"), x.get("name"))), None)
+        if not c:
+            sys.exit("库里没这个符：%s" % a.show)
+        f = os.path.join(CARD_ROOT, c.get("file") or "")
+        rel = (c.get("file") or "").replace("\\", "/")
+        print("ID　　：%s" % c.get("id"))
+        print("名字　：%s" % c.get("name"))
+        print("类型　：%s" % c.get("type"))
+        print("管什么：%s" % (c.get("intro") or "（没写）"))
+        print("何时调：%s" % (c.get("call") or "（没写）"))
+        print("标签　：%s" % (" / ".join(c.get("tags") or []) or "（没打标签）"))
+        print("图　　：out/符/%s%s" % (rel, "" if os.path.isfile(f) else "  ⚠ 图丢了"))
+        if os.path.isfile(f):
+            print("　　　　%d KB" % (os.path.getsize(f) // 1024))
+        print("建档　：%s" % c.get("created"))
+        return 0
+
+    if not cards:
+        if lib["cards"]:
+            print("没搜到。库里有 %d 张，去掉 --q / --tag 再看一遍。" % len(lib["cards"]))
+        else:
+            print("库里还没有符。")
+            print("做一张：python scripts/vidu.py card --name 太极拳 "
+                  "--prompt-file out/符/符-太极拳/prompt.txt --meta out/符/符-太极拳/meta.json")
+        return 0
+
+    print("库里 %d 张符%s" % (len(cards), "（筛过）" if (q or a.tag) else ""))
+    print("")
+    for c in cards:
+        f = os.path.join(CARD_ROOT, c.get("file") or "")
+        print("%s ｜ %s" % (c.get("id"), c.get("name")))
+        print("   %s" % (c.get("intro") or "（没写简介）"))
+        tag = " / ".join(c.get("tags") or [])
+        note = "" if os.path.isfile(f) else "  ⚠ 图丢了"
+        if tag or note:
+            print("   %s%s" % (tag or "—", note))
+        print("")
+    print("看详情：python scripts/vidu.py lib --show <ID>")
     return 0
 
 
@@ -490,14 +771,41 @@ def main():
     p.set_defaults(fn=cmd_pull)
 
     p = sub.add_parser("image", help="生图（资产图 / 参考图）")
-    p.add_argument("--prompt", required=True)
+    p.add_argument("--prompt", default="")
+    p.add_argument("--prompt-file", default="")
     p.add_argument("--ref", action="append", default=[], help="参考图，可重复")
     p.add_argument("--name", default="")
     p.add_argument("--out", default=os.path.join(ROOT, "out"))
     p.add_argument("--ratio", default="9:16")
+    p.add_argument("--resolution", default="", help="留空用默认；文字糊了可试 2k / 4k")
     p.add_argument("--model", default=IMG_MODEL)
+    p.add_argument("--wait", type=int, default=300, help="最多等多少秒")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=cmd_image)
+
+    p = sub.add_parser("card", help="做一张符（16:9 能力面板）")
+    p.add_argument("--prompt", default="")
+    p.add_argument("--prompt-file", default="")
+    p.add_argument("--name", default="", help="能力名，出图存 out/符/符-名字/panel.png")
+    p.add_argument("--meta", default="", help="第一个代码块的 JSON，用来入库")
+    p.add_argument("--tag", action="append", default=[], help="标签，可重复")
+    p.add_argument("--ref", action="append", default=[], help="参考图，可重复")
+    p.add_argument("--out", default="", help="默认 out/符/<名字>/")
+    p.add_argument("--ratio", default="16:9")
+    p.add_argument("--resolution", default="", help="留空用默认；文字糊了可试 2k / 4k")
+    p.add_argument("--model", default=IMG_MODEL)
+    p.add_argument("--wait", type=int, default=300, help="最多等多少秒")
+    p.add_argument("--no-lib", action="store_true", help="生完不入库")
+    p.add_argument("--dry-run", action="store_true")
+    p.set_defaults(fn=cmd_card)
+
+    p = sub.add_parser("lib", help="符库：列出 / 搜索 / 详情 / 补录 / 移除")
+    p.add_argument("--q", default="", help="搜 id、名字、简介、标签")
+    p.add_argument("--tag", action="append", default=[], help="按标签筛，可重复")
+    p.add_argument("--show", default="", help="看某张符的详情（ID 或名字）")
+    p.add_argument("--add", default="", help="把已有符目录补录进库")
+    p.add_argument("--rm", default="", help="只从库里移除条目，不删图")
+    p.set_defaults(fn=cmd_lib)
 
     a = ap.parse_args()
     return a.fn(a)

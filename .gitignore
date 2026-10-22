@@ -8,3 +8,6 @@ Thumbs.db
 token.txt
 out/
 *.mp4
+
+# 工作台 / 记忆，不往外发
+.workbuddy/

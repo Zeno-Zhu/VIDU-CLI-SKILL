@@ -26,6 +26,9 @@ python scripts/vidu.py pull --out ./out
 
 # 生图
 python scripts/vidu.py image --prompt "人物设定图：..." --name 男主 --ratio 9:16
+
+# 做符（16:9 能力面板）
+python scripts/vidu.py card --name 太极拳 --prompt-file out/符/符-太极拳/prompt.txt
 ```
 
 `--image` 可以重复，最多 9 张，**顺序对应【资产盘点】的 pn1 / pn2**。
@@ -54,9 +57,46 @@ python scripts/vidu.py image --prompt "人物设定图：..." --name 男主 --ra
 | `--mode` | `nopeak` / `normal` | 默认 nopeak（闲时） |
 | `--model` | 一般不用填 | 视频默认 3.4，生图默认 3.2_image_2_5_pro |
 
-分辨率固定 1080p，脚本里写死了，够用。
+分辨率固定 1080p，脚本里写死了，够用。生图和做符（`image` / `card`）可以用 `--resolution 2k` 试，报 `Invalid resolution` 就退回默认。
 
 **不要传 transition。** Q4 没这个参数，传了直接报错。脚本也没开放它。
+
+---
+
+## 生图与符
+
+| 项 | `image`（资产图） | `card`（符） |
+|---|---|---|
+| 默认比例 | 9:16 | 16:9 |
+| 落到哪 | `out/<名字>.png` | `out/符/符-<名字>/panel.png` |
+| 调度 | `normal`，扣积分 | 同左 |
+| 参考图 | `--ref`，可重复 | 同左 |
+| 分辨率 | 默认，可试 `2k` | 同左 |
+| 提示词 | `--prompt` / `--prompt-file` | 同左 |
+| 入库 | — | `--meta` 给 JSON，`--tag` 打标签；`--no-lib` 不入 |
+| 等待上限 | `--wait`，默认 300 秒 | 同左 |
+
+**符库**
+
+```bash
+python scripts/vidu.py lib                   # 列表
+python scripts/vidu.py lib --q 太极 --tag 动作 # 搜
+python scripts/vidu.py lib --show 符-太极拳    # 详情
+python scripts/vidu.py lib --add out/符/符-运镜 # 补录旧符
+python scripts/vidu.py lib --rm 符-运镜        # 只移索引，不删图
+```
+
+索引在 `out/符/_库.json`，纯 JSON，手改也认（别改 `id`）。
+
+库默认跟着脚本走：skill 装在哪，库就在哪。有两份 skill（工作区 + 安装目录）想共用一个库，设环境变量 `VIDU_CARD_ROOT` 指到同一个 `out/符`。
+
+**生图不走闲时额度。** 闲时只给视频，图和符都扣积分，开工前 `check` 看余额。
+
+符的提示词压到 1500 字以内。超 2000 字会被拒，或者模型只记住前半段——脚本会提醒你字数。
+
+`card` 会把实际用的提示词另存一份到 `out/符/符-<名字>/prompt.txt`，改字重跑时改它，别重写整段。
+
+等超时不算失败，拿 task_id 去 vidu.cn 上看就行。
 
 ---
 
