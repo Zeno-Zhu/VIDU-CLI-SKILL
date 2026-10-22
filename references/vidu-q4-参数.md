@@ -109,8 +109,13 @@ python scripts/vidu.py lib --rm 符-运镜        # 只移索引，不删图
 - 每天 200 条，0 积分
 - 单条最长 16 秒
 - 同时最多 **100 条**在跑
-- 不带音频（带音频直接 403）
+- **音色参考可以用**（`--audio`，上限 3 条）—— 音色是「参考音色」，不是「音频驱动口型」
+- **开 lip_sync（音频驱动口型/整段音频对齐）时不能用闲时**，会报 `withaudio & lipsync nopeak mode is not allowed`
 - **默认就是 nopeak**；想花积分才显式写 `--mode normal`
+
+> 这两件事别混：**音色参考（audio prompt，`with_audio=false`）闲时可用**；
+> **唇同步（`with_audio=true` + `lip_sync=true`）闲时禁用**。
+> 早期文档写的「闲时不能带音频」指的是后者，2026-10-23 实测前者在 nopeak 下正常出片。
 
 ---
 
@@ -135,7 +140,7 @@ python scripts/vidu.py lib --rm 符-运镜        # 只移索引，不删图
 | `Q4 does not support claw_pass` | 模式用错 | 改 `nopeak` 或 `normal` |
 | `duration X out of range` | 时长超界 | 参考生视频 1–16，图生视频 3–16 |
 | `Q4 character2video requires an image...` | 没给素材 | 至少一张图 |
-| `withaudio & lipsync nopeak mode is not allowed` | 闲时带了音频 | 去音频，或 `--mode normal` |
+| `withaudio & lipsync nopeak mode is not allowed` | 闲时开了 lip_sync | 关掉 lip_sync，或 `--mode normal`（单纯带 `--audio` 音色参考不受影响） |
 | `Invalid resolution` | 分辨率写错 | 用 1080p |
 | `INSUFFICIENT_CREDITS` | 积分不够 | 充值，或改走闲时 |
 | `CONTENT_MODERATION` | 审核没过 | 换说法，别写真实人名 |

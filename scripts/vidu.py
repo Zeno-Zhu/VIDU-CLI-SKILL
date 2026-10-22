@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import mimetypes
 import os
 import subprocess
@@ -41,6 +42,31 @@ INFLIGHT = ("created", "queueing", "preparation", "scheduling", "processing")
 DONE = ("success", "failed", "canceled", "error")
 
 IMG_MODEL = "3.2_image_2_5_pro"
+
+# ── 生图提示词的两句固定话 ───────────────────────────────────
+# 开场语：堵住模型自己翻译、自己改写术语、自己加戏。
+OPEN_LINE = ("请一字不改严格按照以下中文提示词生成图片，"
+             "不要翻译、不要改写、不要添加内容：")
+
+# 尾缀：压碎噪点与冗余高频细节。按风格化程度伸缩，不是越长越好。
+# 完整版出处：倒放《一体成型：image 2.5 碎噪点已攻克》
+TAIL_FULL = "归约细节灭高频冗余，软泛焦均质简谐流"
+TAIL_MID = "归约细节，灭高频冗余"
+TAIL_MIN = "归约细节"
+TAILS = {"full": TAIL_FULL, "mid": TAIL_MID, "min": TAIL_MIN, "none": ""}
+
+
+def _wrap(text, tail="full"):
+    """开场语 + 正文 + 尾缀。正文一个字不改，重复调用不会叠加。"""
+    text = (text or "").strip()
+    if not text:
+        return text
+    if not text.startswith(OPEN_LINE):
+        text = OPEN_LINE + "\n\n" + text
+    t = TAILS.get(tail, TAIL_FULL)
+    if t and not text.rstrip().endswith(t):
+        text = text.rstrip() + "\n\n" + t
+    return text
 
 
 # ─────────────────────── Token ───────────────────────
@@ -134,13 +160,22 @@ class API:
         except Exception:
             return ""
 
-    def upload(self, path):
+    def upload(self, path, kind="image"):
+        """上传素材。kind="audio" 时按音频元数据建单（duration 取整秒）。"""
         if not os.path.isfile(path):
             raise RuntimeError("找不到素材：%s" % path)
         mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
-        wh = self._probe(path, "stream=width,height").replace(",", "x").split("x")
-        meta = {"image-width": wh[0] if wh[0].isdigit() else "1024",
-                "image-height": wh[1] if len(wh) > 1 and wh[1].isdigit() else "1024"}
+        if kind == "audio":
+            d = self._probe(path, "format=duration")
+            try:
+                secs = max(1, int(math.ceil(float(d))))
+            except (TypeError, ValueError):
+                secs = 1
+            meta = {"duration": str(secs)}
+        else:
+            wh = self._probe(path, "stream=width,height").replace(",", "x").split("x")
+            meta = {"image-width": wh[0] if wh[0].isdigit() else "1024",
+                    "image-height": wh[1] if len(wh) > 1 and wh[1].isdigit() else "1024"}
         c, b = self.req("POST", "/tools/v1/files/uploads", {"metadata": meta, "scene": "vidu"})
         if c != 200:
             raise RuntimeError("建上传失败 %s: %s" % (c, b[:200]))
@@ -226,17 +261,25 @@ def build_payload(job, api, mode, cache):
 
     prompts = [{"type": "text", "content": job["prompt"]}]
     for img in job.get("images") or []:
-        prompts.append({"type": "image", "content": _up(api, img, cache)})
+        prompts.append({"type": "image", "content": _up(api, img, cache, "image")})
+    # 音色参考：≤3 条（官方上限，超出会被静默忽略）
+    auds = job.get("audios") or []
+    if len(auds) > 3:
+        print("⚠ 音色 %d 条超过上限 3，只取前 3 条" % len(auds))
+        auds = auds[:3]
+    for au in auds:
+        prompts.append({"type": "audio", "content": _up(api, au, cache, "audio"),
+                        "name": os.path.basename(au)})
     return {"type": kind,
             "input": {"prompts": prompts, "editor_mode": "normal", "enhance": True},
             "settings": settings}
 
 
-def _up(api, path, cache):
+def _up(api, path, cache, kind="image"):
     st = os.stat(path)
-    k = "%s|%d|%d" % (os.path.abspath(path), st.st_size, int(st.st_mtime))
+    k = "%s|%d|%d|%s" % (os.path.abspath(path), st.st_size, int(st.st_mtime), kind)
     if k not in cache:
-        cache[k] = api.upload(path)
+        cache[k] = api.upload(path, kind=kind)
     return cache[k]
 
 
@@ -274,19 +317,21 @@ def cmd_submit(a):
         sys.exit("需要 --prompt 或 --prompt-file")
     job = {"id": a.name or "single", "prompt": text.strip(),
            "duration": a.duration, "ratio": a.ratio,
-           "images": a.image, "type": a.type, "model": a.model}
+           "images": a.image, "audios": a.audio, "type": a.type, "model": a.model}
     payload = build_payload(job, api, a.mode, {})
     if a.dry_run:
-        print("[dry] %s %ss 图%d 模式%s"
+        print("[dry] %s %ss 图%d 音%d 模式%s"
               % (payload["type"], payload["settings"]["duration"],
-                 len(a.image), payload["settings"]["schedule_mode"]))
+                 len(a.image), len(a.audio), payload["settings"]["schedule_mode"]))
+        for au in a.audio:
+            print("      音色参考：%s" % os.path.basename(au))
         print(text.strip()[:200])
         return 0
     try:
         r = api.submit(payload)
     except RuntimeError as e:
         print("提交失败：%s" % e)
-        print("常见原因：时长超界 / 没给图 / 提示词太长 / 闲时带了音频")
+        print("常见原因：时长超界 / 没给图 / 提示词太长 / 音色超过 3 条 / 开了 lip_sync 又用闲时")
         return 1
     tid = str(r.get("id"))
     print("task_id = %s" % tid)
@@ -307,13 +352,15 @@ def cmd_batch(a):
         line = raw.rstrip("\r\n")
         if not line.strip() or line.lstrip().startswith("#"):
             continue
-        c = line.split("\t") + [""] * 4
-        sid, pfile, imgs, dur = c[0].strip(), c[1].strip(), c[2].strip(), c[3].strip()
+        c = line.split("\t") + [""] * 5
+        sid, pfile, imgs, dur, auds = (c[0].strip(), c[1].strip(), c[2].strip(),
+                                       c[3].strip(), c[4].strip())
         if not sid or not pfile:
             print("⚠ 第 %d 行缺镜头号或提示词文件，跳过" % ln)
             continue
         rows.append({"id": sid, "prompt_file": pfile,
                      "images": [x.strip() for x in imgs.split(",") if x.strip()],
+                     "audios": [x.strip() for x in auds.split(",") if x.strip()],
                      "duration": int(dur or a.duration)})
 
     led = load_ledger(a.ledger)
@@ -340,9 +387,10 @@ def cmd_batch(a):
             continue
         job = {"id": r["id"], "prompt": open(r["prompt_file"], encoding="utf-8").read(),
                "duration": r["duration"], "ratio": a.ratio,
-               "images": r["images"], "type": a.type}
+               "images": r["images"], "audios": r.get("audios") or [], "type": a.type}
         if a.dry_run:
-            print("[dry] %s %ss 图%d" % (r["id"], job["duration"], len(r["images"])))
+            print("[dry] %s %ss 图%d 音%d"
+                  % (r["id"], job["duration"], len(r["images"]), len(job["audios"])))
             ok += 1
             continue
         try:
@@ -416,12 +464,13 @@ def cmd_pull(a):
 
 
 def cmd_image(a):
-    text = _read_prompt(a)
+    text = _wrap(_read_prompt(a), getattr(a, "tail", "full"))
     os.makedirs(a.out, exist_ok=True)
     name = a.name or "img"
     if a.dry_run:
-        print("[dry] %s ｜ %d 字 ｜ → %s"
-              % (a.ratio, len(text), os.path.join(a.out, name + ".png")))
+        print("[dry] %s ｜ %d 字 ｜ 尾缀：%s ｜ → %s"
+              % (a.ratio, len(text), _tail_label(a),
+                 os.path.join(a.out, name + ".png")))
         return 0
     api = API()
     job = {"id": name, "prompt": text,
@@ -432,7 +481,7 @@ def cmd_image(a):
     _warn_long(text)
     r = api.submit(payload)
     tid = str(r.get("id"))
-    print("生图任务 %s，等它出…" % tid)
+    print("生图任务 %s，等它出…（尾缀：%s）" % (tid, _tail_label(a)))
     d = _wait_image(api, tid, a.wait)
     if d.get("state") != "success":
         print("失败：%s %s" % (d.get("err_code"), d.get("err_msg")))
@@ -446,7 +495,7 @@ def cmd_image(a):
 
 def cmd_card(a):
     """符：16:9 能力面板。一张图讲清一个 AI 视频能力。"""
-    text = _read_prompt(a)
+    text = _wrap(_read_prompt(a), getattr(a, "tail", "full"))
     raw = (a.name or "").strip() or time.strftime("符-%m%d-%H%M")
     name = _slug(raw)
     if not name.startswith("符"):
@@ -454,8 +503,9 @@ def cmd_card(a):
     out = a.out or os.path.join(ROOT, "out", "符", name)
 
     if a.dry_run:
-        print("[dry] %s ｜ %d 字 ｜ → %s"
-              % (a.ratio, len(text), os.path.join(out, "panel.png")))
+        print("[dry] %s ｜ %d 字 ｜ 尾缀：%s ｜ → %s"
+              % (a.ratio, len(text), _tail_label(a),
+                 os.path.join(out, "panel.png")))
         print(text[:160].replace("\n", " "))
         return 0
 
@@ -468,12 +518,12 @@ def cmd_card(a):
     payload = build_payload(job, api, "normal", {})
 
     _warn_long(text)
-    # 存一份实际用的提示词，改字重跑时直接改它
+    # 存一份实际用的提示词（含开场语和尾缀），改字重跑时直接改它
     open(os.path.join(out, "prompt.txt"), "w", encoding="utf-8").write(text)
 
     r = api.submit(payload)
     tid = str(r.get("id"))
-    print("生图任务 %s，等它出…" % tid)
+    print("生图任务 %s，等它出…（尾缀：%s）" % (tid, _tail_label(a)))
     d = _wait_image(api, tid, a.wait)
     if d.get("state") != "success":
         print("失败：%s %s" % (d.get("err_code"), d.get("err_msg")))
@@ -490,6 +540,8 @@ def cmd_card(a):
         else:
             mp = os.path.join(out, "meta.json")
             meta = dict(_read_meta(mp)) if os.path.isfile(mp) else {}
+        # 实际用的尾缀登记进档案，别人照着跑能得到同样结果
+        meta["tail"] = _tail_label(a)
         if a.meta and os.path.abspath(a.meta) != os.path.abspath(os.path.join(out, "meta.json")):
             with open(os.path.join(out, "meta.json"), "w", encoding="utf-8") as f:
                 json.dump(meta, f, ensure_ascii=False, indent=1)
@@ -501,6 +553,11 @@ def cmd_card(a):
             print("   ⚠ 没给 --meta，这张符在库里只有名字，没有「管什么 / 何时调」。"
                   "补一个：lib --add %s" % out)
     return 0
+
+
+def _tail_label(a):
+    t = getattr(a, "tail", "full")
+    return TAILS.get(t, TAIL_FULL) or "无"
 
 
 def _read_prompt(a):
@@ -738,6 +795,8 @@ def main():
     p.add_argument("--prompt", default="")
     p.add_argument("--prompt-file", default="")
     p.add_argument("--image", action="append", default=[], help="可重复，顺序对应 pn1/pn2")
+    p.add_argument("--audio", action="append", default=[],
+                   help="音色参考，可重复（上限 3）；顺序对应 vm1/vm2")
     p.add_argument("--duration", type=int, default=10)
     p.add_argument("--ratio", default="9:16")
     p.add_argument("--type", default="character2video",
@@ -780,6 +839,8 @@ def main():
     p.add_argument("--resolution", default="", help="留空用默认；文字糊了可试 2k / 4k")
     p.add_argument("--model", default=IMG_MODEL)
     p.add_argument("--wait", type=int, default=300, help="最多等多少秒")
+    p.add_argument("--tail", default="full", choices=list(TAILS),
+                   help="尾缀档位：full 风格化（默认）/ mid 还嫌锐 / min 真人写实 / none 不加")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=cmd_image)
 
@@ -796,6 +857,8 @@ def main():
     p.add_argument("--model", default=IMG_MODEL)
     p.add_argument("--wait", type=int, default=300, help="最多等多少秒")
     p.add_argument("--no-lib", action="store_true", help="生完不入库")
+    p.add_argument("--tail", default="full", choices=list(TAILS),
+                   help="尾缀档位：full 风格化（默认）/ mid 还嫌锐 / min 真人写实 / none 不加")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=cmd_card)
 
