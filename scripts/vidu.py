@@ -1,24 +1,30 @@
 # -*- coding: utf-8 -*-
-"""vidu.py —— 内置的 Vidu 客户端（纯 Python，不需要 Node / npm）。
+"""vidu.py —— Vidu 统一客户端（纯 Python，零第三方依赖）
 
-只做几件事：查额度、提交、查进度、下载，外加生图、做符、管符库。
-**它不是调度器**，排队补位这些交给 AI 做。
+激活码：包内带 scripts/license.py 才校验，没有就跳过。
 
-    python scripts/vidu.py check
-    python scripts/vidu.py submit --prompt-file S01.txt --image 人物/男主.png --duration 10
-    python scripts/vidu.py batch --jobs jobs.tsv
-    python scripts/vidu.py status
-    python scripts/vidu.py pull --out ./out
-    python scripts/vidu.py image --prompt "人物设定图：..." --name 男主
-    python scripts/vidu.py card --name 太极拳 --prompt-file out/符/符-太极拳/prompt.txt
-    python scripts/vidu.py lib
-    python scripts/vidu.py lib --q 太极 --show 符-太极拳
+命令
+    python scripts/vidu.py check                  # 额度 + 积分 + 档位（开工第一件事）
+    python scripts/vidu.py quota                  # 同上，只打数
+    python scripts/vidu.py accounts               # 多账号额度
+    python scripts/vidu.py submit --prompt-file G01.txt --image 人物/男主.png --duration 12
+    python scripts/vidu.py batch  --jobs jobs.tsv # 作业表批量（带台账，断了能续）
+    python scripts/vidu.py run    --jobs jobs_vidu.json   # 作业单批量（带门禁）
+    python scripts/vidu.py status                 # 查台账进度
+    python scripts/vidu.py pull   --out ./out      # 下载已完成（只认无水印）
+    python scripts/vidu.py image  --prompt "…" --name 男主 --tail min
+    python scripts/vidu.py card   --name 太极拳 --prompt-file …/prompt.txt
+    python scripts/vidu.py lib                    # 符库：内置常用符 + 自己做的
+    python scripts/vidu.py lib --show 符-常用运镜
 
-Token 从四个地方找，先找到先用：
-    1. 环境变量 VIDU_TOKEN
-    2. ~/.vidu-cli-skill/token.txt   ← 初始化脚本写这里，git pull 不会丢
-    3. skill 目录的 .env 里的 VIDU_TOKEN
-    4. 本目录的 token.txt
+Token 五个来源，先找到先用：
+    1. 环境变量 VIDU_TOKEN / VIDU_TOKEN_1..N
+    2. ~/.vidu-cli-skill/token.txt          （初始化脚本会写这里）
+    3. 逐级向上的 .env 里的 VIDU_TOKEN(_N)   （有多账号时用这个）
+    4. scripts/token.txt
+    5. ./token.txt
+
+★ 参数唯一口径：references/vidu-参数.md
 """
 from __future__ import annotations
 
@@ -36,90 +42,119 @@ import urllib.request
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
 HOME_DIR = os.path.join(os.path.expanduser("~"), ".vidu-cli-skill")
-BASE = os.environ.get("VIDU_BASE_URL", "https://service.vidu.cn").rstrip("/")
-DEFAULT_LEDGER = os.path.join(ROOT, "out", "_台账.json")
+
+# ── 参数口径（改这里一处，全包跟着变）─────────────────────────
+VIDU_MAX_SECONDS = 16          # 参考生视频 1—16；图生视频 3—16
+VIDU_MIN_SECONDS = 1
+TARGET_LOW, TARGET_HIGH = 12, 16
+MAX_IMAGES, MAX_AUDIOS, MAX_PROMPT_CHARS = 9, 3, 2000
+
+DEFAULT_RATIO = "9:16"
+DEFAULT_RESOLUTION = "1080p"
+VIDEO_MODEL = "3.4"
+IMG_MODELS = {"fast": "3.2_image_2_5_fast",
+              "pro": "3.2_image_2_5_pro",
+              "base": "3.2_image_2"}
+IMG_MODEL = IMG_MODELS["pro"]
+
 INFLIGHT = ("created", "queueing", "preparation", "scheduling", "processing")
 DONE = ("success", "failed", "canceled", "error")
 
-IMG_MODEL = "3.2_image_2_5_pro"
-
-# ── 生图提示词的两句固定话 ───────────────────────────────────
-# 开场语：堵住模型自己翻译、自己改写术语、自己加戏。
+# ── 生图的两句固定话（正文一个字不改）───────────────────────
 OPEN_LINE = ("请一字不改严格按照以下中文提示词生成图片，"
              "不要翻译、不要改写、不要添加内容：")
-
-# 尾缀：压碎噪点与冗余高频细节。按风格化程度伸缩，不是越长越好。
-# 完整版出处：倒放《一体成型：image 2.5 碎噪点已攻克》
 TAIL_FULL = "归约细节灭高频冗余，软泛焦均质简谐流"
 TAIL_MID = "归约细节，灭高频冗余"
 TAIL_MIN = "归约细节"
 TAILS = {"full": TAIL_FULL, "mid": TAIL_MID, "min": TAIL_MIN, "none": ""}
 
-
-def _wrap(text, tail="full"):
-    """开场语 + 正文 + 尾缀。正文一个字不改，重复调用不会叠加。"""
-    text = (text or "").strip()
-    if not text:
-        return text
-    if not text.startswith(OPEN_LINE):
-        text = OPEN_LINE + "\n\n" + text
-    t = TAILS.get(tail, TAIL_FULL)
-    if t and not text.rstrip().endswith(t):
-        text = text.rstrip() + "\n\n" + t
-    return text
+DEFAULT_LEDGER = os.path.join(ROOT, "out", "_台账.json")
 
 
-# ─────────────────────── Token ───────────────────────
-def load_token():
-    t = (os.environ.get("VIDU_TOKEN") or "").strip()
-    if t:
-        return t, "环境变量"
-    p = os.path.join(HOME_DIR, "token.txt")
-    if os.path.isfile(p):
-        v = open(p, encoding="utf-8").read().strip()
-        if v:
-            return v, p
-    for d in (ROOT, os.path.dirname(ROOT)):
+# ─────────────────────── 配置 / Token ───────────────────────
+def load_dotenv():
+    """从本目录往上找 .env（最多 6 级），只补未设置的键。"""
+    d = ROOT
+    for _ in range(6):
         p = os.path.join(d, ".env")
         if os.path.isfile(p):
-            with open(p, encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    if line.startswith("VIDU_TOKEN="):
-                        v = line.split("=", 1)[1].strip().strip('"').strip("'")
-                        if v:
-                            return v, p
-    p = os.path.join(HERE, "token.txt")
-    if os.path.isfile(p):
-        v = open(p, encoding="utf-8").read().strip()
-        if v:
-            return v, p
-    return None, None
+            try:
+                with open(p, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#") or "=" not in line:
+                            continue
+                        k, v = line.split("=", 1)
+                        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+            except Exception:
+                pass
+            return p
+        nd = os.path.dirname(d)
+        if d == nd:
+            break
+        d = nd
+    return None
 
 
-def need_token():
-    t, _ = load_token()
+load_dotenv()
+
+
+def base_url():
+    return (os.environ.get("VIDU_BASE_URL") or "https://service.vidu.cn").rstrip("/")
+
+
+def tokens():
+    """{序号: token}；0 = 未编号的单账号。"""
+    out = {}
+    if (os.environ.get("VIDU_TOKEN") or "").strip():
+        out[0] = os.environ["VIDU_TOKEN"].strip()
+    i = 1
+    while (os.environ.get("VIDU_TOKEN_%d" % i) or "").strip():
+        out[i] = os.environ["VIDU_TOKEN_%d" % i].strip()
+        i += 1
+    if out:
+        return out
+    # 文件兜底（先看用户目录，再看包内）
+    cands = [os.path.join(HOME_DIR, "token.txt"),
+             os.path.join(HERE, "token.txt"),
+             os.path.join(os.getcwd(), "token.txt")]
+    for p in cands:
+        if os.path.isfile(p):
+            v = open(p, encoding="utf-8").read().strip()
+            if v:
+                return {0: v}
+    return {}
+
+
+def need_token(account=None):
+    t = tokens()
     if not t:
-        print("还没配 Token。两个办法：")
+        print("还没配 Token。三选一：")
         print("  1) 双击 skill 目录下的「1-初始化环境.cmd」，它会带你走一遍")
-        print("  2) 手动：在 %s 建 token.txt，里面写 token" % HOME_DIR)
+        print("  2) 在本目录建 .env，写一行 VIDU_TOKEN=vda_xxx")
+        print("  3) 在 %s 建 token.txt，里面写 token" % HOME_DIR)
         print("")
         print("Token 在 vidu.cn 左下角头像 → Vidu Token")
         sys.exit(2)
-    return t
+    if account is not None and account in t:
+        return t[account]
+    if 0 in t:
+        return t[0]
+    k = int(os.environ.get("VIDU_DEFAULT_ACCOUNT", "1"))
+    return t.get(k) or t[sorted(t)[0]]
 
 
-# ─────────────────────── 请求层 ───────────────────────
-class API:
-    def __init__(self, token=None):
-        self.token = token or need_token()
+# ─────────────────────── 客户端 ───────────────────────
+class Vidu:
+    def __init__(self, token=None, account=None):
+        self.token = token or need_token(account)
         self.h = {"Authorization": "Token " + self.token,
                   "Content-Type": "application/json",
-                  "User-Agent": "vidu-cli-skill/1.0"}
+                  "User-Agent": "vidu-unified-cli/2.0"}
 
-    def req(self, method, path, payload=None, timeout=120):
+    def req(self, method, path, payload=None, timeout=180):
         data = json.dumps(payload).encode() if payload is not None else None
-        url = path if path.startswith("http") else BASE + path
+        url = path if path.startswith("http") else base_url() + path
         r = urllib.request.Request(url, data=data, method=method, headers=self.h)
         try:
             with urllib.request.urlopen(r, timeout=timeout) as resp:
@@ -139,16 +174,33 @@ class API:
     def quota(self):
         _, q = self.jget("/vidu/v1/tasks/quota")
         nq = q.get("nopeak_quota") or {}
-        total = nq.get("total") or 0
-        used = nq.get("used") or 0
+        total, used = nq.get("total") or 0, nq.get("used") or 0
         _, me = self.jget("/credit/v1/credits/me")
         return {"total": total, "used": used,
                 "left": max(0, total - used) if total else 0,
-                "credits": me.get("credits")}
+                "credits": me.get("credits"),
+                "concurrency": me.get("concurrency")}
+
+    def history(self, pagesz=100, pages=1, types=None):
+        """最新优先。★ offset = pagesz × page，page=0 才是第一页（2026-10-24 实测）。"""
+        seen, out = set(), []
+        for pg in range(0, max(1, pages)):
+            q = "/vidu/v1/tasks/history/me?pager.pagesz=%d&pager.page=%d" % (min(pagesz, 100), pg)
+            if types:
+                q += "&types=" + types
+            _, j = self.jget(q)
+            ts = j.get("tasks") or []
+            for t in ts:
+                tid = str(t.get("id"))
+                if tid not in seen:
+                    seen.add(tid)
+                    out.append(t)
+            if len(ts) < pagesz:
+                break
+        return out
 
     def inflight(self):
-        _, j = self.jget("/vidu/v1/tasks/history/me?pager.pagesz=100&pager.page=0")
-        return [t for t in (j.get("tasks") or []) if t.get("state") in INFLIGHT]
+        return [t for t in self.history(100, 2) if t.get("state") in INFLIGHT]
 
     @staticmethod
     def _probe(path, entries):
@@ -161,7 +213,6 @@ class API:
             return ""
 
     def upload(self, path, kind="image"):
-        """上传素材。kind="audio" 时按音频元数据建单（duration 取整秒）。"""
         if not os.path.isfile(path):
             raise RuntimeError("找不到素材：%s" % path)
         mime = mimetypes.guess_type(path)[0] or "application/octet-stream"
@@ -171,7 +222,7 @@ class API:
                 secs = max(1, int(math.ceil(float(d))))
             except (TypeError, ValueError):
                 secs = 1
-            meta = {"duration": str(secs)}
+            meta = {"duration": str(secs)}          # ★ 字段名必须是 duration
         else:
             wh = self._probe(path, "stream=width,height").replace(",", "x").split("x")
             meta = {"image-width": wh[0] if wh[0].isdigit() else "1024",
@@ -243,46 +294,116 @@ class API:
 
 
 # ─────────────────────── 请求体 ───────────────────────
-def build_payload(job, api, mode, cache):
-    kind = job.get("type") or "character2video"
-    is_image = kind in ("text2image", "reference2image")
-    settings = {
-        "duration": 0 if is_image else int(job.get("duration") or 10),
-        "model_version": job.get("model") or (IMG_MODEL if is_image else "3.4"),
-        "resolution": job.get("resolution") or "1080p",
-        "aspect_ratio": job.get("ratio") or "9:16",
-        "sample_count": 1,
-        "schedule_mode": "normal" if is_image else mode,
-        "movement_amplitude": "auto",
-        "use_trial": bool(is_image),
-    }
-    if not is_image:
-        settings["codec"] = "h265"
-
-    prompts = [{"type": "text", "content": job["prompt"]}]
-    for img in job.get("images") or []:
-        prompts.append({"type": "image", "content": _up(api, img, cache, "image")})
-    # 音色参考：≤3 条（官方上限，超出会被静默忽略）
-    auds = job.get("audios") or []
-    if len(auds) > 3:
-        print("⚠ 音色 %d 条超过上限 3，只取前 3 条" % len(auds))
-        auds = auds[:3]
-    for au in auds:
-        prompts.append({"type": "audio", "content": _up(api, au, cache, "audio"),
-                        "name": os.path.basename(au)})
-    return {"type": kind,
-            "input": {"prompts": prompts, "editor_mode": "normal", "enhance": True},
-            "settings": settings}
+def _path_of(x):
+    return x.get("path") if isinstance(x, dict) else x
 
 
-def _up(api, path, cache, kind="image"):
+def _name_of(x, default=""):
+    if isinstance(x, dict):
+        return (x.get("name") or os.path.basename(_path_of(x) or "")).strip() or default
+    return os.path.basename(x or "") or default
+
+
+def _up(api, path, cache, kind="image", fresh=False):
+    if not path or not os.path.isfile(path):
+        raise RuntimeError("素材不存在：%s" % path)
     st = os.stat(path)
     k = "%s|%d|%d|%s" % (os.path.abspath(path), st.st_size, int(st.st_mtime), kind)
-    if k not in cache:
+    if fresh or k not in cache:
         cache[k] = api.upload(path, kind=kind)
     return cache[k]
 
 
+def build_video_payload(job, api, mode, cache):
+    dur = int(job.get("duration") or 0)
+    if not (VIDU_MIN_SECONDS <= dur <= VIDU_MAX_SECONDS):
+        raise RuntimeError("时长 %s 超界（参考生视频 %d—%d 秒）"
+                           % (dur, VIDU_MIN_SECONDS, VIDU_MAX_SECONDS))
+    imgs = job.get("images") or []
+    auds = job.get("audios") or []
+    if len(imgs) > MAX_IMAGES:
+        raise RuntimeError("图片 %d 张 > %d 上限" % (len(imgs), MAX_IMAGES))
+    if len(auds) > MAX_AUDIOS:
+        print("⚠ 音色 %d 条超过上限 %d，只取前 %d 条" % (len(auds), MAX_AUDIOS, MAX_AUDIOS))
+        auds = auds[:MAX_AUDIOS]
+
+    settings = {
+        "duration": dur,
+        "model_version": job.get("model_version") or VIDEO_MODEL,
+        "resolution": job.get("resolution") or DEFAULT_RESOLUTION,
+        "aspect_ratio": job.get("ratio") or DEFAULT_RATIO,
+        "sample_count": int(job.get("count") or 1),
+        "schedule_mode": mode,
+        "codec": "h265",
+        "movement_amplitude": "auto",
+        "use_trial": False,
+    }
+    prompts = [{"type": "text", "content": job["prompt"]}]
+    for img in imgs:
+        prompts.append({"type": "image", "content": _up(api, _path_of(img), cache, "image")})
+    for au in auds:
+        p = _path_of(au)
+        prompts.append({"type": "audio", "content": _up(api, p, cache, "audio"),
+                        "name": _name_of(au) or os.path.basename(p)})
+    return {"type": job.get("type") or "character2video",
+            "input": {"prompts": prompts, "editor_mode": "normal", "enhance": True},
+            "settings": settings}
+
+
+def build_image_payload(job, api, mode, cache):
+    """无 ref ⇒ text2image；有 ref ⇒ reference2image。
+
+    ★ r2i 的每张参考图要**上传两次**：`content`（裁剪图）+ `src_imgs[0]`（原图），
+      两个必须是**不同的 upload id**（复用同一个会丢参考）。
+    """
+    refs = job.get("refs") or []
+    mv = IMG_MODELS.get(job.get("model") or "pro", job.get("model") or IMG_MODEL)
+    settings = {
+        "duration": 0,
+        "resolution": job.get("resolution") or DEFAULT_RESOLUTION,
+        "aspect_ratio": job.get("ratio") or "16:9",
+        "sample_count": int(job.get("count") or 1),
+        "movement_amplitude": "auto",
+        "schedule_mode": mode,
+        "model_version": mv,
+        "use_trial": True,
+        "image_count": max(1, len(refs)),
+        "codec": "h265",
+    }
+    prompts = [{"type": "text", "content": job["prompt"]}]
+    for i, p in enumerate(refs, 1):
+        a = _up(api, p, cache, "image")
+        b = api.upload(p, "image")            # ★ 不复用缓存，必须另一个 id
+        w, h = _wh(p)
+        prompts.append({"type": "image", "content": a, "src_imgs": [b],
+                        "selected_region": {"top_left": {"x": 0, "y": 0},
+                                            "bottom_right": {"x": w, "y": h}},
+                        "name": "图%d" % i})
+    return {"type": "reference2image" if refs else "text2image",
+            "input": {"prompts": prompts, "editor_mode": "normal", "enhance": True},
+            "settings": settings}
+
+
+def _wh(path):
+    o = Vidu._probe(path, "stream=width,height").replace(",", "x").split("x")
+    try:
+        return int(o[0]), int(o[1])
+    except Exception:
+        return 1024, 1024
+
+
+def quote_image(api, payload):
+    s = payload["settings"]
+    q = ("/vidu/v1/tasks/credits?type=%s&settings.duration=0&settings.resolution=%s"
+         "&settings.aspect_ratio=%s&settings.model_version=%s&settings.schedule_mode=%s"
+         "&settings.sample_count=%d&settings.image_count=%d"
+         % (payload["type"], s["resolution"], s["aspect_ratio"], s["model_version"],
+            s["schedule_mode"], s["sample_count"], s["image_count"]))
+    c, j = api.jget(q)
+    return j if isinstance(j, dict) else {}
+
+
+# ─────────────────────── 台账 ───────────────────────
 def load_ledger(path):
     if path and os.path.isfile(path):
         try:
@@ -297,41 +418,118 @@ def save_ledger(path, data):
     json.dump(data, open(path, "w", encoding="utf-8"), ensure_ascii=False, indent=1)
 
 
-# ─────────────────────── 命令 ───────────────────────
+def pick_url(c, allow_watermark=False):
+    """★ 只认无水印：download_uri / nomark_uri。只有 uri = 中间态，继续等。"""
+    for k in ("download_uri", "nomark_uri"):
+        if c.get(k):
+            return str(c[k])
+    if allow_watermark and c.get("uri"):
+        print("⚠ 显式允许水印版：这张/这段会带「Vidu AI 生成」角标")
+        return str(c["uri"])
+    return None
+
+
+# ─────────────────────── 命令：查 ───────────────────────
 def cmd_check(a):
-    api = API()
+    api = Vidu(account=a.account)
     q = api.quota()
-    live = api.inflight()
-    print("闲时额度：%d/%d（今天还能跑 %d 条）" % (q["used"], q["total"], q["left"]))
+    total = q["total"]
+    if not total:
+        tier = "查不到闲时额度"
+    elif total >= 100:
+        tier = "旗舰版（200 条/天）"
+    elif total <= 30:
+        tier = "专业版（20 条/天）"
+    else:
+        tier = "自定义额度（%d 条/天）" % total
+    print("账号版本：%s" % tier)
+    print("闲时额度：%d/%d（今天还能跑 %d 条）" % (q["used"], total, q["left"]))
     print("积分余额：%s" % q["credits"])
-    print("进行中的任务：%d 条" % len(live))
+    print("进行中任务：%d 条（并发上限 100）" % len(api.inflight()))
     print("")
-    print("可以开工了。")
+    print("单组时长 1—16 秒（目标 12—16）；默认只走闲时，不扣积分。")
     return 0
 
 
+def cmd_quota(a):
+    api = Vidu(account=a.account)
+    q = api.quota()
+    print("闲时 %d/%d（余 %d）｜积分 %s｜进行中 %d"
+          % (q["used"], q["total"], q["left"], q["credits"], len(api.inflight())))
+    return 0
+
+
+def cmd_accounts(a):
+    t = tokens()
+    if not t:
+        print("未配置任何账号")
+        return 1
+    for n in sorted(t):
+        try:
+            q = Vidu(token=t[n]).quota()
+            print("账号%-2s 闲时 %d/%d（余 %d）  积分 %s"
+                  % (n or "-", q["used"], q["total"], q["left"], q["credits"]))
+        except Exception as e:
+            print("账号%-2s ✗ %s" % (n or "-", e))
+    return 0
+
+
+def gate(api, need, quiet=False):
+    """提交前的额度门禁：不够就停（不是等）。"""
+    q = api.quota()
+    left = q["left"]
+    if q["total"] and left < need:
+        print("=" * 66)
+        print(" ⛔ 闲时额度不足 —— 已停止作业（不硬跑到平台报错，也不空转等待）")
+        print("=" * 66)
+        print(" 今日闲时：%d / %d（剩余 %d）" % (q["used"], q["total"], left))
+        print(" 本次需要：%d" % need)
+        print("")
+        print(" ⇒ 二选一：")
+        print("   A. 换账号：改 .env 里的 VIDU_DEFAULT_ACCOUNT，或加 --account N")
+        print("   B. 等明天：额度 0 点重置，明早重跑同一条命令，已完成的组会自动跳过")
+        print("=" * 66)
+        return False
+    if not quiet:
+        print("闲时额度：%d/%d，剩余 %d ≥ 本次 %d ⇒ 放行" % (q["used"], q["total"], left, need))
+    return True
+
+
+# ─────────────────────── 命令：提交 ───────────────────────
 def cmd_submit(a):
-    api = API()
-    text = a.prompt or (open(a.prompt_file, encoding="utf-8").read() if a.prompt_file else "")
-    if not text.strip():
+    text = (a.prompt or "").strip()
+    if not text and a.prompt_file:
+        if not os.path.isfile(a.prompt_file):
+            sys.exit("找不到提示词文件：%s" % a.prompt_file)
+        text = open(a.prompt_file, encoding="utf-8").read().strip()
+    if not text:
         sys.exit("需要 --prompt 或 --prompt-file")
-    job = {"id": a.name or "single", "prompt": text.strip(),
+    if len(text) > MAX_PROMPT_CHARS:
+        print("⚠ 提示词 %d 字，超过 %d 上限，容易被拒或只记住前半段" % (len(text), MAX_PROMPT_CHARS))
+
+    job = {"id": a.name or "single", "prompt": text,
            "duration": a.duration, "ratio": a.ratio,
-           "images": a.image, "audios": a.audio, "type": a.type, "model": a.model}
-    payload = build_payload(job, api, a.mode, {})
+           "images": a.image, "audios": a.audio,
+           "type": a.type, "model_version": a.model or VIDEO_MODEL,
+           "resolution": a.resolution, "count": a.count}
+    api = Vidu(account=a.account)
     if a.dry_run:
-        print("[dry] %s %ss 图%d 音%d 模式%s"
-              % (payload["type"], payload["settings"]["duration"],
-                 len(a.image), len(a.audio), payload["settings"]["schedule_mode"]))
+        print("[dry] %s %ss 图%d 音%d 模式%s 比例%s"
+              % (job["type"], a.duration, len(a.image), len(a.audio), a.mode, a.ratio))
         for au in a.audio:
             print("      音色参考：%s" % os.path.basename(au))
-        print(text.strip()[:200])
+        print(text[:160].replace("\n", " "))
         return 0
+    try:
+        payload = build_video_payload(job, api, a.mode, {})
+    except RuntimeError as e:
+        print("提交失败：%s" % e)
+        return 1
     try:
         r = api.submit(payload)
     except RuntimeError as e:
         print("提交失败：%s" % e)
-        print("常见原因：时长超界 / 没给图 / 提示词太长 / 音色超过 3 条 / 开了 lip_sync 又用闲时")
+        print("常见原因：时长超界 / 没给图 / 提示词太长 / 音色超 3 条 / 开了 lip_sync 又用闲时")
         return 1
     tid = str(r.get("id"))
     print("task_id = %s" % tid)
@@ -344,7 +542,7 @@ def cmd_submit(a):
 
 
 def cmd_batch(a):
-    api = API()
+    """作业表：组号 / 提示词文件 / 图片(逗号) / 时长 / 音色(逗号，可选)"""
     if not os.path.isfile(a.jobs):
         sys.exit("找不到作业表：%s" % a.jobs)
     rows = []
@@ -356,28 +554,31 @@ def cmd_batch(a):
         sid, pfile, imgs, dur, auds = (c[0].strip(), c[1].strip(), c[2].strip(),
                                        c[3].strip(), c[4].strip())
         if not sid or not pfile:
-            print("⚠ 第 %d 行缺镜头号或提示词文件，跳过" % ln)
+            print("⚠ 第 %d 行缺组号或提示词文件，跳过" % ln)
             continue
         rows.append({"id": sid, "prompt_file": pfile,
                      "images": [x.strip() for x in imgs.split(",") if x.strip()],
                      "audios": [x.strip() for x in auds.split(",") if x.strip()],
                      "duration": int(dur or a.duration)})
-
     led = load_ledger(a.ledger)
-    todo = [r for r in rows if r["id"] not in led]
+    todo = [r for r in rows if a.force or r["id"] not in led]
     print("共 %d 条，待提交 %d 条" % (len(rows), len(todo)))
     if not todo:
         print("都提交过了，用 status 看进度")
         return 0
 
-    q = api.quota()
-    if q["left"] and len(todo) > q["left"]:
-        print("⚠ 今天闲时还剩 %d 条，你要交 %d 条，超了会失败" % (q["left"], len(todo)))
+    api = Vidu(account=a.account)
     if len(todo) > 100:
-        print("⚠ 闲时同时最多 100 个任务在跑，你交 %d 条。" % len(todo))
-        print("  建议先交 100 条，跑完一批再补；或者加 --force 硬提交。")
+        print("⚠ 同时最多 100 条在跑，本次 %d 条；建议先交 100 条，跑完一批再补" % len(todo))
         if not a.force:
             return 1
+    if a.dry_run:
+        for r in todo:
+            print("[dry] %s %ss 图%d 音%d" % (r["id"], r["duration"],
+                                              len(r["images"]), len(r["audios"])))
+        return 0
+    if not gate(api, len(todo)):
+        return 2
 
     cache, ok, fail = {}, 0, 0
     for r in todo:
@@ -385,27 +586,22 @@ def cmd_batch(a):
             print("[%s] ✗ 找不到 %s" % (r["id"], r["prompt_file"]))
             fail += 1
             continue
-        job = {"id": r["id"], "prompt": open(r["prompt_file"], encoding="utf-8").read(),
+        job = {"id": r["id"],
+               "prompt": open(r["prompt_file"], encoding="utf-8").read(),
                "duration": r["duration"], "ratio": a.ratio,
-               "images": r["images"], "audios": r.get("audios") or [], "type": a.type}
-        if a.dry_run:
-            print("[dry] %s %ss 图%d 音%d"
-                  % (r["id"], job["duration"], len(r["images"]), len(job["audios"])))
-            ok += 1
-            continue
+               "images": r["images"], "audios": r["audios"], "type": a.type}
         try:
-            res = api.submit(build_payload(job, api, a.mode, cache))
+            res = api.submit(build_video_payload(job, api, a.mode, cache))
             tid = str(res.get("id"))
             led[r["id"]] = {"task_id": tid, "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
                             "duration": job["duration"]}
+            save_ledger(a.ledger, led)
             ok += 1
             print("[%s] → %s" % (r["id"], tid), flush=True)
-            save_ledger(a.ledger, led)
         except Exception as e:
             fail += 1
             print("[%s] ✗ %s" % (r["id"], e), flush=True)
         time.sleep(a.pause)
-
     print("")
     print("提交成功 %d ｜ 失败 %d" % (ok, fail))
     if ok:
@@ -413,9 +609,66 @@ def cmd_batch(a):
     return 0 if not fail else 1
 
 
-def cmd_status(a):
-    api = API()
+def cmd_run(a):
+    """作业单 jobs_vidu.json（批量格式）。带台账、带门禁、可续跑。"""
+    if not os.path.isfile(a.jobs):
+        sys.exit("找不到作业单：%s" % a.jobs)
+    d = json.load(open(a.jobs, encoding="utf-8"))
+    jobs = d.get("jobs") if isinstance(d, dict) else d
+    if a.job:
+        jobs = [j for j in jobs if a.job in (j.get("id"), j.get("src_id"))]
     led = load_ledger(a.ledger)
+    for j in jobs:
+        if j.get("task_id") and j.get("id") not in led:
+            led[j["id"]] = {"task_id": str(j["task_id"]), "at": j.get("at") or ""}
+    todo = jobs if a.force else [j for j in jobs if j.get("id") not in led]
+    if a.limit:
+        todo = todo[:a.limit]
+    print("作业单 %d 组 ｜ 已有台账 %d 组 ｜ 待提交 %d 组"
+          % (len(jobs), len(jobs) - len([j for j in jobs if j.get("id") not in led]), len(todo)))
+    if not todo:
+        print("都提交过了，用 status / pull 收片")
+        return 0
+    api = Vidu(account=a.account)
+    if a.dry_run:
+        for j in todo:
+            print("[dry] %-22s %ss %s 图%d 音%d %s"
+                  % (j.get("id"), j.get("duration"), j.get("ratio") or DEFAULT_RATIO,
+                     len(j.get("images") or []), len(j.get("audios") or []), a.mode))
+        return 0
+    if not gate(api, len(todo)):
+        return 2
+
+    cache, ok, fail = {}, [], []
+    for j in todo:
+        jid = j.get("id")
+        try:
+            payload = build_video_payload(j, api, a.mode, cache)
+            r = api.submit(payload)
+            tid = str(r.get("id"))
+            ok.append((jid, tid))
+            led[jid] = {"task_id": tid, "at": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                        "duration": j.get("duration")}
+            save_ledger(a.ledger, led)
+            print("%-22s → %s" % (jid, tid), flush=True)
+        except Exception as e:
+            fail.append((jid, str(e)))
+            print("%-22s ✗ %s" % (jid, e), flush=True)
+        time.sleep(a.pause)
+    print("\n提交成功 %d｜失败 %d" % (len(ok), len(fail)))
+    for jid, e in fail:
+        print("  失败 %s：%s" % (jid, e))
+    return 0 if not fail else 1
+
+
+def cmd_status(a):
+    api = Vidu(account=a.account)
+    led = load_ledger(a.ledger)
+    if a.jobs and os.path.isfile(a.jobs):
+        d = json.load(open(a.jobs, encoding="utf-8"))
+        for j in (d.get("jobs") if isinstance(d, dict) else d):
+            if j.get("task_id"):
+                led.setdefault(j.get("id"), {"task_id": str(j["task_id"])})
     if not led:
         sys.exit("台账是空的：%s" % a.ledger)
     stat = {}
@@ -426,21 +679,26 @@ def cmd_status(a):
         extra = ""
         if st == "failed":
             extra = " %s %s" % (d.get("err_code") or "", d.get("err_msg") or "")
-        print("%-12s %s%s" % (sid, st, extra))
+        print("%-16s %s%s" % (sid, st, extra))
     print("")
     print("汇总：" + " ｜ ".join("%s %d" % (k, v) for k, v in sorted(stat.items())))
     return 0
 
 
 def cmd_pull(a):
-    api = API()
+    api = Vidu(account=a.account)
     led = load_ledger(a.ledger)
+    if a.jobs and os.path.isfile(a.jobs):
+        d = json.load(open(a.jobs, encoding="utf-8"))
+        for j in (d.get("jobs") if isinstance(d, dict) else d):
+            if j.get("task_id"):
+                led.setdefault(j.get("id"), {"task_id": str(j["task_id"])})
     if not led:
         sys.exit("台账是空的：%s" % a.ledger)
     os.makedirs(a.out, exist_ok=True)
     got = 0
     for sid, rec in led.items():
-        dst = os.path.join(a.out, sid + ".mp4")
+        dst = os.path.join(a.out, "%s%s.mp4" % (sid, a.suffix))
         if os.path.isfile(dst) and os.path.getsize(dst) > 1024:
             continue
         d = api.task(rec["task_id"])
@@ -448,13 +706,19 @@ def cmd_pull(a):
             continue
         try:
             cs = api.creations(rec["task_id"])
-            url = next((str(c[k]) for c in cs for k in ("download_uri", "nomark_uri", "uri")
-                        if c.get(k)), None)
-            if not url:
-                print("[%s] 没拿到下载地址" % sid)
+            total, n = len(cs), 0
+            for i, c in enumerate(cs):
+                url = pick_url(c, a.allow_watermark)
+                if not url:
+                    continue
+                one = dst if total == 1 else os.path.join(
+                    a.out, "%s%s_%d.mp4" % (sid, a.suffix, i + 1))
+                api.download(url, one)
+                n += 1
+            if not n:
+                print("[%s] success 但还没有无水印地址（中间态）⇒ 稍后重跑同一条命令" % sid)
                 continue
-            api.download(url, dst)
-            got += 1
+            got += n
             print("[%s] ✓ %.1f MB" % (sid, os.path.getsize(dst) / 1048576), flush=True)
         except Exception as e:
             print("[%s] ✗ %s" % (sid, e))
@@ -463,183 +727,180 @@ def cmd_pull(a):
     return 0
 
 
-def cmd_image(a):
-    text = _wrap(_read_prompt(a), getattr(a, "tail", "full"))
-    os.makedirs(a.out, exist_ok=True)
-    name = a.name or "img"
-    if a.dry_run:
-        print("[dry] %s ｜ %d 字 ｜ 尾缀：%s ｜ → %s"
-              % (a.ratio, len(text), _tail_label(a),
-                 os.path.join(a.out, name + ".png")))
-        return 0
-    api = API()
-    job = {"id": name, "prompt": text,
-           "type": "reference2image" if a.ref else "text2image",
-           "ratio": a.ratio, "images": a.ref or [], "model": a.model,
-           "resolution": a.resolution}
-    payload = build_payload(job, api, "normal", {})
-    _warn_long(text)
-    r = api.submit(payload)
-    tid = str(r.get("id"))
-    print("生图任务 %s，等它出…（尾缀：%s）" % (tid, _tail_label(a)))
-    d = _wait_image(api, tid, a.wait)
-    if d.get("state") != "success":
-        print("失败：%s %s" % (d.get("err_code"), d.get("err_msg")))
-        return 1
-    dest = os.path.join(a.out, name + ".png")
-    if not _save_image(api, tid, dest):
-        return 1
-    print("存好了：%s（%d KB）" % (dest, os.path.getsize(dest) // 1024))
-    return 0
-
-
-def cmd_card(a):
-    """符：16:9 能力面板。一张图讲清一个 AI 视频能力。"""
-    text = _wrap(_read_prompt(a), getattr(a, "tail", "full"))
-    raw = (a.name or "").strip() or time.strftime("符-%m%d-%H%M")
-    name = _slug(raw)
-    if not name.startswith("符"):
-        name = "符-" + name
-    out = a.out or os.path.join(ROOT, "out", "符", name)
-
-    if a.dry_run:
-        print("[dry] %s ｜ %d 字 ｜ 尾缀：%s ｜ → %s"
-              % (a.ratio, len(text), _tail_label(a),
-                 os.path.join(out, "panel.png")))
-        print(text[:160].replace("\n", " "))
-        return 0
-
-    os.makedirs(out, exist_ok=True)
-    api = API()
-    job = {"id": name, "prompt": text,
-           "type": "reference2image" if a.ref else "text2image",
-           "ratio": a.ratio, "images": a.ref or [], "model": a.model,
-           "resolution": a.resolution}
-    payload = build_payload(job, api, "normal", {})
-
-    _warn_long(text)
-    # 存一份实际用的提示词（含开场语和尾缀），改字重跑时直接改它
-    open(os.path.join(out, "prompt.txt"), "w", encoding="utf-8").write(text)
-
-    r = api.submit(payload)
-    tid = str(r.get("id"))
-    print("生图任务 %s，等它出…（尾缀：%s）" % (tid, _tail_label(a)))
-    d = _wait_image(api, tid, a.wait)
-    if d.get("state") != "success":
-        print("失败：%s %s" % (d.get("err_code"), d.get("err_msg")))
-        return 1
-    dest = os.path.join(out, "panel.png")
-    if not _save_image(api, tid, dest):
-        return 1
-    print("符出好了：%s（%d KB）" % (dest, os.path.getsize(dest) // 1024))
-    print("错字就改 %s 再跑一遍，别重画整段。" % os.path.join(out, "prompt.txt"))
-
-    if not a.no_lib:
-        if a.meta:
-            meta = dict(_read_meta(a.meta))
-        else:
-            mp = os.path.join(out, "meta.json")
-            meta = dict(_read_meta(mp)) if os.path.isfile(mp) else {}
-        # 实际用的尾缀登记进档案，别人照着跑能得到同样结果
-        meta["tail"] = _tail_label(a)
-        if a.meta and os.path.abspath(a.meta) != os.path.abspath(os.path.join(out, "meta.json")):
-            with open(os.path.join(out, "meta.json"), "w", encoding="utf-8") as f:
-                json.dump(meta, f, ensure_ascii=False, indent=1)
-        if a.tag:
-            meta["tags"] = a.tag
-        n = upsert_card(_card_entry(out, meta))
-        print("入库：%s ｜ 库里现在 %d 张，`lib` 可以看" % (meta.get("name") or name, n))
-        if not meta:
-            print("   ⚠ 没给 --meta，这张符在库里只有名字，没有「管什么 / 何时调」。"
-                  "补一个：lib --add %s" % out)
-    return 0
-
-
-def _tail_label(a):
-    t = getattr(a, "tail", "full")
-    return TAILS.get(t, TAIL_FULL) or "无"
-
-
-def _read_prompt(a):
-    text = (getattr(a, "prompt", "") or "").strip()
-    if not text and getattr(a, "prompt_file", ""):
-        if not os.path.isfile(a.prompt_file):
-            sys.exit("找不到提示词文件：%s" % a.prompt_file)
-        text = open(a.prompt_file, encoding="utf-8").read().strip()
+# ─────────────────────── 命令：生图 ───────────────────────
+def _wrap(text, tail="min"):
+    text = (text or "").strip()
     if not text:
-        sys.exit("需要 --prompt 或 --prompt-file")
+        return text
+    if not text.startswith(OPEN_LINE):
+        text = OPEN_LINE + "\n\n" + text
+    t = TAILS.get(tail, TAIL_MIN)
+    if t and not text.rstrip().endswith(t):
+        text = text.rstrip() + "\n\n" + t
     return text
 
 
-def _slug(s):
-    bad = '\\/:*?"<>|\n\r\t'
-    s = "".join(("_" if c in bad else c) for c in s).strip().strip(".")
-    return s or "符"
+def _tail_label(tail):
+    return TAILS.get(tail, TAIL_MIN) or "无"
 
 
-def _warn_long(text):
-    if len(text) > 2000:
-        print("⚠ 提示词 %d 字，超过 2000 字容易被拒，或者模型只记住前半段。"
-              "压到 1500 字内再跑。" % len(text))
+def _read_items(a):
+    items = []
+    if (getattr(a, "prompt", "") or "").strip():
+        items.append(((a.name or "").strip(), a.prompt.strip()))
+    if getattr(a, "prompt_file", ""):
+        if not os.path.isfile(a.prompt_file):
+            sys.exit("找不到提示词文件：%s" % a.prompt_file)
+        for line in open(a.prompt_file, encoding="utf-8"):
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "||" in line:
+                t, body = line.split("||", 1)
+                items.append((t.strip(), body.strip()))
+            else:
+                items.append(("", line))
+    if not items:
+        sys.exit("需要 --prompt 或 --prompt-file")
+    return items
 
 
-def _wait_image(api, tid, limit):
-    d, t0 = {}, time.time()
-    while time.time() - t0 < limit:
-        d = api.task(tid)
-        if d.get("state") in DONE:
-            return d
-        time.sleep(3)
-    print("等了 %d 秒还没出完，拿 task_id 去 vidu.cn 上看：%s" % (limit, tid))
-    return d
+def _safe(s, n=60):
+    s = "".join(ch for ch in (s or "image") if ch not in '\\/:*?"<>|\r\n\t').strip()
+    return (s[:n] or "image").strip(".")
 
 
-def _save_image(api, tid, dest):
-    cs = api.creations(tid)
-    url = next((str(c[k]) for c in cs for k in ("download_uri", "nomark_uri", "uri")
-                if c.get(k)), None)
-    if not url:
-        print("没拿到图片地址")
-        return None
-    try:
-        api.download(url, dest)
-    except Exception as e:
-        print("下载失败：%s" % e)
-        return None
-    return dest
-
-
-# ─────────────────────── 符库 ───────────────────────
-# 一张符 = 一个文件夹 + 一条索引。索引是纯 JSON，手改也行，改完别动 id。
-# 默认跟着脚本走：skill 装在哪，库就在哪。有两份 skill 想共用一个库，设 VIDU_CARD_ROOT。
-CARD_ROOT = os.environ.get("VIDU_CARD_ROOT") or os.path.join(ROOT, "out", "符")
-LIB = os.path.join(CARD_ROOT, "_库.json")
-
-
-def load_lib():
-    if os.path.isfile(LIB):
+def cmd_image(a):
+    api = Vidu(account=a.account)
+    items = _read_items(a)
+    mode = a.mode
+    if a.ref and mode == "nopeak":
+        print("⚠ 参考图生图不支持闲时（平台 403）⇒ 本条强制走 normal（花积分）")
+        mode = "normal"
+    os.makedirs(a.out, exist_ok=True)
+    cache, ok, fail = {}, 0, 0
+    for idx, (nm, text) in enumerate(items, 1):
+        wrapped = _wrap(text, a.tail)
+        if len(wrapped) > MAX_PROMPT_CHARS:
+            print("⚠ 提示词 %d 字，超过 %d 易被拒；压到 1500 内更稳"
+                  % (len(wrapped), MAX_PROMPT_CHARS))
+        job = {"prompt": wrapped, "refs": a.ref, "model": a.model, "ratio": a.ratio,
+               "resolution": a.resolution, "count": a.count}
         try:
-            j = json.load(open(LIB, encoding="utf-8-sig"))
+            payload = build_image_payload(job, api, mode, cache)
+        except Exception as e:
+            print("[%d/%d] ✗ 组装失败：%s" % (idx, len(items), e))
+            fail += 1
+            continue
+        q = quote_image(api, payload)
+        cost, left = q.get("cost_credits"), q.get("current_credits")
+        tag = "%s/%s" % (payload["type"], payload["settings"]["model_version"])
+        if a.dry_run:
+            print("[dry] %-16s %-24s %s 积分（余额 %s）｜%s 字"
+                  % (nm or "image", tag, cost, left, len(wrapped)))
+            continue
+        print("[%d/%d] %-16s %-24s 预计 %s 积分（余额 %s）"
+              % (idx, len(items), nm or "image", tag, cost, left), flush=True)
+        try:
+            r = api.submit(payload)
+        except Exception as e:
+            print("      ✗ 提交失败：%s" % e)
+            fail += 1
+            continue
+        tid = str(r.get("id"))
+        print("      task_id = %s" % tid, flush=True)
+        st, waited = "created", 0
+        while waited < a.timeout:
+            st = (api.task(tid) or {}).get("state") or st
+            if st in DONE:
+                break
+            time.sleep(a.interval)
+            waited += a.interval
+        if st != "success":
+            print("      ✗ %s（%s）" % (st, (api.task(tid) or {}).get("err_code") or ""))
+            fail += 1
+            continue
+        cs = api.creations(tid)
+        got = 0
+        for i, c in enumerate(cs):
+            url = pick_url(c, a.allow_watermark)
+            if not url:
+                continue
+            base = _safe(nm or text)
+            name = base + (".png" if len(cs) == 1 else "_%d.png" % (i + 1))
+            dest = os.path.join(a.out, name)
+            api.download(url, dest)
+            got += 1
+            print("      ✅ %s（%.1f MB）" % (dest, os.path.getsize(dest) / 1048576))
+        if got:
+            ok += 1
+        else:
+            print("      ⚠ success 但拿不到无水印地址（中间态）⇒ 稍后重跑同一命令即可")
+            fail += 1
+    if a.dry_run:
+        print("\n[dry] 共 %d 条，未提交" % len(items))
+        return 0
+    print("\n出图成功 %d｜失败 %d" % (ok, fail))
+    return 0 if not fail else 1
+
+
+# ─────────────────────── 命令：符（做 / 库）───────────────────────
+BUILTIN_CARD_ROOT = os.path.join(ROOT, "assets", "常用符")
+USER_CARD_ROOT = os.path.join(ROOT, "out", "符")
+
+
+def card_roots():
+    roots = []
+    env = os.environ.get("VIDU_CARD_ROOT")
+    if env:
+        roots.append(env)
+    for r in (BUILTIN_CARD_ROOT, USER_CARD_ROOT):
+        if os.path.isdir(r) and r not in roots:
+            roots.append(r)
+    return roots
+
+
+def _card_index(root):
+    p = os.path.join(root, "_库.json")
+    if os.path.isfile(p):
+        try:
+            j = json.load(open(p, encoding="utf-8-sig"))
             if isinstance(j, dict) and isinstance(j.get("cards"), list):
                 return j
         except Exception:
-            print("⚠ 符库索引坏了（%s），这次先当空库用，别急着重写它" % LIB)
+            print("⚠ 符库索引坏了（%s），这次当空库用" % p)
     return {"version": 1, "cards": []}
 
 
-def save_lib(lib):
-    os.makedirs(CARD_ROOT, exist_ok=True)
+def save_card_index(root, lib):
+    os.makedirs(root, exist_ok=True)
     lib["version"] = 1
     lib["updated"] = time.strftime("%Y-%m-%dT%H:%M:%S")
-    with open(LIB, "w", encoding="utf-8") as f:
+    with open(os.path.join(root, "_库.json"), "w", encoding="utf-8") as f:
         json.dump(lib, f, ensure_ascii=False, indent=1)
 
 
-def _rel(p):
-    try:
-        return os.path.relpath(p, CARD_ROOT).replace("\\", "/")
-    except Exception:
-        return p
+def all_cards():
+    """内置常用符 + 用户自建，一起返回（带 _root / _builtin）。"""
+    out = []
+    for root in card_roots():
+        lib = _card_index(root)
+        builtin = os.path.abspath(root) == os.path.abspath(BUILTIN_CARD_ROOT)
+        for c in lib.get("cards") or []:
+            c = dict(c)
+            c["_root"] = root
+            c["_builtin"] = builtin
+            out.append(c)
+    return out
+
+
+def _tags(v):
+    if isinstance(v, str):
+        s = v
+        for ch in (",", "，", "、", "/", "|", ";"):
+            s = s.replace(ch, " ")
+        v = s.split()
+    return [str(t).strip() for t in (v or []) if str(t).strip()]
 
 
 def _read_meta(path):
@@ -651,23 +912,12 @@ def _read_meta(path):
         j = json.load(open(path, encoding="utf-8-sig"))
         return j if isinstance(j, dict) else {}
     except Exception as e:
-        print("⚠ meta 不是合法 JSON（%s），按文件夹名入库" % e)
+        print("⚠ meta 不是合法 JSON（%s）" % e)
         return {}
 
 
-def _tags(v):
-    """标签手写成字符串也行：「动作, 教学」或「动作、教学」都认。"""
-    if isinstance(v, str):
-        s = v
-        for ch in (",", "，", "、", "/", "|", ";"):
-            s = s.replace(ch, " ")
-        v = s.split()
-    return [str(t).strip() for t in (v or []) if str(t).strip()]
-
-
 def _card_entry(folder, meta):
-    """meta 就是符系统第一个代码块：name / type / intro / prompt。"""
-    cid = _slug(os.path.basename(os.path.normpath(folder)))
+    cid = _safe(os.path.basename(os.path.normpath(folder)), 60)
     return {
         "id": cid,
         "name": (meta.get("name") or cid).strip(),
@@ -675,43 +925,106 @@ def _card_entry(folder, meta):
         "intro": (meta.get("intro") or "").strip(),
         "call": (meta.get("prompt") or "").strip(),
         "tags": _tags(meta.get("tags")),
-        "file": _rel(os.path.join(folder, "panel.png")),
-        "created": time.strftime("%Y-%m-%d"),
+        "status": (meta.get("status") or "候选").strip(),
+        "parent": (meta.get("parent") or "").strip(),
+        "file": os.path.relpath(os.path.join(folder, "panel.png"), USER_CARD_ROOT).replace("\\", "/"),
+        "created": meta.get("created") or time.strftime("%Y-%m-%d"),
     }
 
 
-def upsert_card(entry):
-    lib = load_lib()
-    old = next((c for c in lib["cards"] if c.get("id") == entry["id"]), {})
-    if old.get("created"):
-        entry["created"] = old["created"]
-    if old.get("tags") and not entry["tags"]:
-        entry["tags"] = old["tags"]
-    lib["cards"] = [c for c in lib["cards"] if c.get("id") != entry["id"]]
-    lib["cards"].append(entry)
-    lib["cards"].sort(key=lambda c: (c.get("created") or "", c.get("id") or ""), reverse=True)
-    save_lib(lib)
-    return len(lib["cards"])
+def cmd_card(a):
+    """做一张符：16:9 能力面板。存 out/符/符-<名字>/，出完自动入库。"""
+    items = _read_items(a)
+    _, text = items[0]
+    wrapped = _wrap(text, a.tail)
+    raw = (a.name or "").strip() or time.strftime("符-%m%d-%H%M")
+    name = _safe(raw, 60)
+    if not name.startswith("符"):
+        name = "符-" + name
+    out = a.out or os.path.join(USER_CARD_ROOT, name)
 
+    if a.dry_run:
+        print("[dry] %s ｜ %d 字 ｜ 尾缀：%s ｜ → %s"
+              % (a.ratio, len(wrapped), _tail_label(a.tail), os.path.join(out, "panel.png")))
+        print(wrapped[:160].replace("\n", " "))
+        return 0
+    os.makedirs(out, exist_ok=True)
+    api = Vidu(account=a.account)
+    job = {"prompt": wrapped, "refs": a.ref, "model": a.model, "ratio": a.ratio,
+           "resolution": a.resolution, "count": 1}
+    payload = build_image_payload(job, api, "normal", {})
+    q = quote_image(api, payload)
+    print("预计 %s 积分（余额 %s）" % (q.get("cost_credits"), q.get("current_credits")))
+    open(os.path.join(out, "prompt.txt"), "w", encoding="utf-8").write(wrapped)
 
-def _clip(s, n):
-    s = (s or "").replace("\n", " ").strip()
-    return s if len(s) <= n else s[:n - 1] + "…"
+    r = api.submit(payload)
+    tid = str(r.get("id"))
+    print("生图任务 %s，等它出…（尾缀：%s）" % (tid, _tail_label(a.tail)))
+    st, waited = "created", 0
+    while waited < a.wait:
+        st = (api.task(tid) or {}).get("state") or st
+        if st in DONE:
+            break
+        time.sleep(3)
+        waited += 3
+    if st != "success":
+        print("失败：%s %s" % ((api.task(tid) or {}).get("err_code"),
+                              (api.task(tid) or {}).get("err_msg")))
+        return 1
+    dest = os.path.join(out, "panel.png")
+    url = None
+    for c in api.creations(tid):
+        url = pick_url(c, a.allow_watermark)
+        if url:
+            break
+    if not url:
+        print("success 但还没有无水印地址（中间态）⇒ 稍后重跑同一条命令")
+        return 1
+    api.download(url, dest)
+    print("符出好了：%s（%d KB）" % (dest, os.path.getsize(dest) // 1024))
+    print("错字就改 %s 再跑一遍，别重画整段。" % os.path.join(out, "prompt.txt"))
+
+    if not a.no_lib:
+        mp = a.meta or os.path.join(out, "meta.json")
+        meta = dict(_read_meta(mp)) if os.path.isfile(mp) else {}
+        meta["tail"] = _tail_label(a.tail)
+        if a.tag:
+            meta["tags"] = a.tag
+        json.dump(meta, open(os.path.join(out, "meta.json"), "w", encoding="utf-8"),
+                  ensure_ascii=False, indent=1)
+        root = USER_CARD_ROOT
+        lib = _card_index(root)
+        e = _card_entry(out, meta)
+        old = next((c for c in lib["cards"] if c.get("id") == e["id"]), {})
+        if old.get("created"):
+            e["created"] = old["created"]
+        if old.get("tags") and not e["tags"]:
+            e["tags"] = old["tags"]
+        lib["cards"] = [c for c in lib["cards"] if c.get("id") != e["id"]] + [e]
+        save_card_index(root, lib)
+        print("入库：%s ｜ 状态 %s ｜ 库里现在 %d 张"
+              % (e["name"], e["status"], len(lib["cards"])))
+        if e["status"] == "候选":
+            print("   现在是候选。用户点头后把 meta.json 的 status 改成「定稿」，再 lib --add 一次。")
+        if not meta:
+            print("   ⚠ 没给 --meta，这张符在库里只有名字。补一个：lib --add %s" % out)
+    return 0
 
 
 def cmd_lib(a):
-    lib = load_lib()
+    cards = all_cards()
 
     if a.rm:
+        root = USER_CARD_ROOT
+        lib = _card_index(root)
         hit = [c for c in lib["cards"] if a.rm in (c.get("id"), c.get("name"))]
         if not hit:
-            sys.exit("库里没这个符：%s" % a.rm)
+            sys.exit("库里没这个符（内置符不可移除）：%s" % a.rm)
         for c in hit:
-            print("移出库：%s（图没删，还在 out/符/%s）"
-                  % (c.get("name"), os.path.dirname(c.get("file") or "")))
+            print("移出库：%s（图没删）" % c.get("name"))
         lib["cards"] = [c for c in lib["cards"] if c not in hit]
-        save_lib(lib)
-        print("库里现在 %d 张。" % len(lib["cards"]))
+        save_card_index(root, lib)
+        print("库里现在 %d 张（不含内置）。" % len(lib["cards"]))
         return 0
 
     if a.add:
@@ -720,19 +1033,27 @@ def cmd_lib(a):
         if not os.path.isdir(folder):
             sys.exit("找不到目录：%s" % folder)
         if not os.path.isfile(os.path.join(folder, "panel.png")):
-            print("⚠ 这个目录里没有 panel.png，入库了也用不了，先确认图在哪")
-        mp = os.path.join(folder, "meta.json")
-        meta = _read_meta(mp) if os.path.isfile(mp) else {}
+            print("⚠ 这个目录里没有 panel.png，入库了也用不了")
+        meta = _read_meta(os.path.join(folder, "meta.json"))
         if a.tag:
             meta["tags"] = a.tag
         e = _card_entry(folder, meta)
-        if e["file"].startswith(".."):
-            print("⚠ 这张符不在 out/符 底下，库只记了个相对路径，换台机器就找不着了")
-        n = upsert_card(e)
-        print("补录：%s ｜ 库里现在 %d 张" % (e["name"], n))
+        if os.path.abspath(folder) != os.path.abspath(BUILTIN_CARD_ROOT) and \
+                not os.path.abspath(folder).startswith(os.path.abspath(USER_CARD_ROOT)):
+            print("⚠ 这张符不在 out/符 底下，库只记相对路径，换机器会找不到")
+        root = USER_CARD_ROOT
+        lib = _card_index(root)
+        lib["cards"] = [c for c in lib["cards"] if c.get("id") != e["id"]] + [e]
+        save_card_index(root, lib)
+        print("补录：%s ｜ 库里现在 %d 张" % (e["name"], len(lib["cards"])))
         return 0
 
-    cards = lib["cards"]
+    if not cards:
+        print("库里还没有符。")
+        print("  · 内置库在 assets/常用符/（随包附带时这里有东西）；")
+        print("  · 自己做一张：python scripts/vidu.py card --name 太极拳 --prompt-file …/prompt.txt")
+        return 0
+
     q = (a.q or "").strip().lower()
     if q:
         cards = [c for c in cards if q in json.dumps(c, ensure_ascii=False).lower()]
@@ -740,134 +1061,162 @@ def cmd_lib(a):
         want = [t.lower() for t in a.tag]
         cards = [c for c in cards
                  if all(t in [str(x).lower() for x in (c.get("tags") or [])] for t in want)]
+    if a.status:
+        cards = [c for c in cards if (c.get("status") or "候选") == a.status]
 
     if a.show:
-        c = next((x for x in lib["cards"]
-                  if a.show in (x.get("id"), x.get("name"))), None)
+        c = next((x for x in all_cards() if a.show in (x.get("id"), x.get("name"))), None)
         if not c:
             sys.exit("库里没这个符：%s" % a.show)
-        f = os.path.join(CARD_ROOT, c.get("file") or "")
-        rel = (c.get("file") or "").replace("\\", "/")
         print("ID　　：%s" % c.get("id"))
         print("名字　：%s" % c.get("name"))
         print("类型　：%s" % c.get("type"))
         print("管什么：%s" % (c.get("intro") or "（没写）"))
         print("何时调：%s" % (c.get("call") or "（没写）"))
+        print("状态　：%s%s" % (c.get("status") or "候选", " ［内置］" if c.get("_builtin") else ""))
+        print("父系　：%s" % (c.get("parent") or "（无）"))
         print("标签　：%s" % (" / ".join(c.get("tags") or []) or "（没打标签）"))
-        print("图　　：out/符/%s%s" % (rel, "" if os.path.isfile(f) else "  ⚠ 图丢了"))
-        if os.path.isfile(f):
-            print("　　　　%d KB" % (os.path.getsize(f) // 1024))
-        print("建档　：%s" % c.get("created"))
+        f = os.path.join(c["_root"], c.get("file") or "")
+        print("图　　：%s%s" % (f, "" if os.path.isfile(f) else "  ⚠ 图丢了"))
         return 0
 
-    if not cards:
-        if lib["cards"]:
-            print("没搜到。库里有 %d 张，去掉 --q / --tag 再看一遍。" % len(lib["cards"]))
-        else:
-            print("库里还没有符。")
-            print("做一张：python scripts/vidu.py card --name 太极拳 "
-                  "--prompt-file out/符/符-太极拳/prompt.txt --meta out/符/符-太极拳/meta.json")
-        return 0
-
-    print("库里 %d 张符%s" % (len(cards), "（筛过）" if (q or a.tag) else ""))
+    print("库里 %d 张符（内置 %d ｜ 自建 %d）"
+          % (len(cards), len([c for c in cards if c.get("_builtin")]),
+             len([c for c in cards if not c.get("_builtin")])))
     print("")
     for c in cards:
-        f = os.path.join(CARD_ROOT, c.get("file") or "")
-        print("%s ｜ %s" % (c.get("id"), c.get("name")))
+        f = os.path.join(c["_root"], c.get("file") or "")
+        mark = "［内置］" if c.get("_builtin") else ""
+        print("%s ｜ %s ［%s］%s" % (c.get("id"), c.get("name"),
+                                    c.get("status") or "候选", mark))
         print("   %s" % (c.get("intro") or "（没写简介）"))
-        tag = " / ".join(c.get("tags") or [])
-        note = "" if os.path.isfile(f) else "  ⚠ 图丢了"
-        if tag or note:
-            print("   %s%s" % (tag or "—", note))
+        print("   何时调：%s" % (c.get("call") or "（没写）"))
+        if not os.path.isfile(f):
+            print("   ⚠ 图丢了：%s" % f)
         print("")
-    print("看详情：python scripts/vidu.py lib --show <ID>")
+    print("看详情：lib --show <ID>")
     return 0
 
 
+# ─────────────────────── main ───────────────────────
 def main():
-    ap = argparse.ArgumentParser(description="Vidu 客户端（纯 Python，免装 Node）")
+    # 激活码：包内有 license.py 才校验，没有就跳过
+    try:
+        from license import ensure_activated  # type: ignore
+    except Exception:
+        ensure_activated = None
+    if ensure_activated and not ensure_activated():
+        return 3
+
+    ap = argparse.ArgumentParser(description="Vidu 统一客户端（提交/查询/下载/生图/做符/符库）")
+    ap.add_argument("--account", type=int, default=None, help="用哪个账号（.env 的 VIDU_TOKEN_N）")
     ap.add_argument("--ledger", default=DEFAULT_LEDGER, help="台账路径")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("check", help="查闲时额度和积分").set_defaults(fn=cmd_check)
+    sub.add_parser("check", help="额度 + 积分 + 档位").set_defaults(fn=cmd_check)
+    sub.add_parser("quota", help="只打额度数字").set_defaults(fn=cmd_quota)
+    sub.add_parser("accounts", help="多账号额度").set_defaults(fn=cmd_accounts)
 
     p = sub.add_parser("submit", help="提交一条")
     p.add_argument("--prompt", default="")
     p.add_argument("--prompt-file", default="")
-    p.add_argument("--image", action="append", default=[], help="可重复，顺序对应 pn1/pn2")
-    p.add_argument("--audio", action="append", default=[],
-                   help="音色参考，可重复（上限 3）；顺序对应 vm1/vm2")
-    p.add_argument("--duration", type=int, default=10)
-    p.add_argument("--ratio", default="9:16")
-    p.add_argument("--type", default="character2video",
-                   choices=["character2video", "img2video"])
+    p.add_argument("--image", action="append", default=[], help="可重复，顺序对应 pn1/pn2…")
+    p.add_argument("--audio", action="append", default=[], help="音色参考，可重复（≤3），对应 vm1…")
+    p.add_argument("--duration", type=int, default=12, help="1—16 整数秒，目标 12—16")
+    p.add_argument("--ratio", default=DEFAULT_RATIO)
+    p.add_argument("--resolution", default=DEFAULT_RESOLUTION)
+    p.add_argument("--type", default="character2video", choices=["character2video", "img2video"])
     p.add_argument("--mode", choices=["nopeak", "normal"], default="nopeak")
-    p.add_argument("--model", default="")
+    p.add_argument("--model", default="", help="一般不用填（默认 3.4）")
+    p.add_argument("--count", type=int, default=1)
     p.add_argument("--name", default="")
     p.add_argument("--ledger", default=DEFAULT_LEDGER)
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=cmd_submit)
 
-    p = sub.add_parser("batch", help="按作业表批量提交")
+    p = sub.add_parser("batch", help="作业表批量（TSV，五列）")
     p.add_argument("--jobs", required=True)
-    p.add_argument("--ratio", default="9:16")
+    p.add_argument("--ratio", default=DEFAULT_RATIO)
+    p.add_argument("--resolution", default=DEFAULT_RESOLUTION)
     p.add_argument("--type", default="character2video")
     p.add_argument("--mode", choices=["nopeak", "normal"], default="nopeak")
-    p.add_argument("--duration", type=int, default=10)
+    p.add_argument("--duration", type=int, default=12)
+    p.add_argument("--pause", type=float, default=1.0)
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--force", action="store_true", help="已提交过的也重交")
+    p.add_argument("--ledger", default=DEFAULT_LEDGER)
+    p.set_defaults(fn=cmd_batch)
+
+    p = sub.add_parser("run", help="作业单批量（jobs_vidu.json）")
+    p.add_argument("--jobs", required=True)
+    p.add_argument("--job", default="", help="只跑某一组")
+    p.add_argument("--limit", type=int, default=0)
+    p.add_argument("--mode", choices=["nopeak", "normal"], default="nopeak")
     p.add_argument("--pause", type=float, default=1.0)
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--force", action="store_true")
     p.add_argument("--ledger", default=DEFAULT_LEDGER)
-    p.set_defaults(fn=cmd_batch)
+    p.set_defaults(fn=cmd_run)
 
-    p = sub.add_parser("status", help="查进度")
+    p = sub.add_parser("status", help="查台账进度")
+    p.add_argument("--jobs", default="")
     p.add_argument("--ledger", default=DEFAULT_LEDGER)
     p.set_defaults(fn=cmd_status)
 
-    p = sub.add_parser("pull", help="下载已完成的")
+    p = sub.add_parser("pull", help="下载已完成（只认无水印）")
     p.add_argument("--out", default=os.path.join(ROOT, "out"))
+    p.add_argument("--jobs", default="")
+    p.add_argument("--suffix", default="", help="落盘后缀，例如 _vidu")
+    p.add_argument("--allow-watermark", action="store_true")
     p.add_argument("--ledger", default=DEFAULT_LEDGER)
     p.set_defaults(fn=cmd_pull)
 
     p = sub.add_parser("image", help="生图（资产图 / 参考图）")
     p.add_argument("--prompt", default="")
-    p.add_argument("--prompt-file", default="")
-    p.add_argument("--ref", action="append", default=[], help="参考图，可重复")
+    p.add_argument("--prompt-file", default="", help="每行一条；『标题||正文』可指定文件名")
+    p.add_argument("--ref", action="append", default=[], help="参考图，可重复（给了就是 r2i）")
     p.add_argument("--name", default="")
     p.add_argument("--out", default=os.path.join(ROOT, "out"))
-    p.add_argument("--ratio", default="9:16")
-    p.add_argument("--resolution", default="", help="留空用默认；文字糊了可试 2k / 4k")
-    p.add_argument("--model", default=IMG_MODEL)
-    p.add_argument("--wait", type=int, default=300, help="最多等多少秒")
-    p.add_argument("--tail", default="full", choices=list(TAILS),
-                   help="尾缀档位：full 风格化（默认）/ mid 还嫌锐 / min 真人写实 / none 不加")
+    p.add_argument("--ratio", default=DEFAULT_RATIO)
+    p.add_argument("--resolution", default=DEFAULT_RESOLUTION)
+    p.add_argument("--model", default="pro", help="fast / pro / base")
+    p.add_argument("--count", type=int, default=1)
+    p.add_argument("--mode", choices=["normal", "nopeak"], default="normal",
+                   help="生图默认花积分；r2i 不支持闲时")
+    p.add_argument("--tail", default="min", choices=list(TAILS),
+                   help="尾缀：min 真人写实（默认）/ mid 带字面板 / full 动漫 / none")
+    p.add_argument("--interval", type=float, default=5.0)
+    p.add_argument("--timeout", type=int, default=900)
+    p.add_argument("--allow-watermark", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=cmd_image)
 
     p = sub.add_parser("card", help="做一张符（16:9 能力面板）")
     p.add_argument("--prompt", default="")
     p.add_argument("--prompt-file", default="")
-    p.add_argument("--name", default="", help="能力名，出图存 out/符/符-名字/panel.png")
-    p.add_argument("--meta", default="", help="第一个代码块的 JSON，用来入库")
-    p.add_argument("--tag", action="append", default=[], help="标签，可重复")
-    p.add_argument("--ref", action="append", default=[], help="参考图，可重复")
-    p.add_argument("--out", default="", help="默认 out/符/<名字>/")
+    p.add_argument("--name", default="")
+    p.add_argument("--meta", default="", help="meta.json 路径（入库用）")
+    p.add_argument("--tag", action="append", default=[])
+    p.add_argument("--ref", action="append", default=[])
+    p.add_argument("--out", default="")
     p.add_argument("--ratio", default="16:9")
-    p.add_argument("--resolution", default="", help="留空用默认；文字糊了可试 2k / 4k")
-    p.add_argument("--model", default=IMG_MODEL)
-    p.add_argument("--wait", type=int, default=300, help="最多等多少秒")
-    p.add_argument("--no-lib", action="store_true", help="生完不入库")
-    p.add_argument("--tail", default="full", choices=list(TAILS),
-                   help="尾缀档位：full 风格化（默认）/ mid 还嫌锐 / min 真人写实 / none 不加")
+    p.add_argument("--resolution", default=DEFAULT_RESOLUTION)
+    p.add_argument("--model", default="pro")
+    p.add_argument("--tail", default="mid", choices=list(TAILS),
+                   help="带字面板默认 mid；full 会把小字糊掉")
+    p.add_argument("--wait", type=int, default=300)
+    p.add_argument("--no-lib", action="store_true")
+    p.add_argument("--allow-watermark", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     p.set_defaults(fn=cmd_card)
 
     p = sub.add_parser("lib", help="符库：列出 / 搜索 / 详情 / 补录 / 移除")
-    p.add_argument("--q", default="", help="搜 id、名字、简介、标签")
-    p.add_argument("--tag", action="append", default=[], help="按标签筛，可重复")
-    p.add_argument("--show", default="", help="看某张符的详情（ID 或名字）")
-    p.add_argument("--add", default="", help="把已有符目录补录进库")
-    p.add_argument("--rm", default="", help="只从库里移除条目，不删图")
+    p.add_argument("--q", default="")
+    p.add_argument("--tag", action="append", default=[])
+    p.add_argument("--show", default="")
+    p.add_argument("--status", default="", choices=["", "候选", "定稿", "弃用"])
+    p.add_argument("--add", default="")
+    p.add_argument("--rm", default="")
     p.set_defaults(fn=cmd_lib)
 
     a = ap.parse_args()

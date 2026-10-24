@@ -53,6 +53,10 @@ exit /b 1
 echo [OK] Python: %RT%
 "%RT%" --version
 echo.
+
+rem ---- 提示词目录设成隐藏：资源管理器里不显示，skill 照常读 ----
+if exist ".prompts" attrib +h ".prompts" >nul 2>&1
+
 "%RT%" "scripts\init_env.py" %*
 echo.
 pause
