@@ -1,4 +1,4 @@
-# 一句话做视频
+# vidu-skill · 一句话做视频
 
 用一句话，做出一条能发的视频。
 
@@ -136,10 +136,13 @@ python scripts/asset_init.py 我的项目
 ## 装进你的 AI（复制这段发给它）
 
 ````
-帮我装一个 skill：VIDU-CLI-SKILL
+帮我装一个 skill：vidu-skill
 仓库：https://github.com/Zeno-Zhu/VIDU-CLI-SKILL.git
 
-1. clone 下来，直接放进这台机器的 skills 目录。
+1. 直接 clone 成 skills 目录下的 vidu-skill，**文件夹名必须是 vidu-skill**：
+
+       git clone https://github.com/Zeno-Zhu/VIDU-CLI-SKILL.git ~/.workbuddy/skills/vidu-skill
+
    WorkBuddy 是 ~/.workbuddy/skills/，Claude Code 是 ~/.claude/skills/，
    不确定就先查你自己的文档，别随便找个地方塞。
 
