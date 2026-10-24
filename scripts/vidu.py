@@ -903,6 +903,13 @@ def _tags(v):
     return [str(t).strip() for t in (v or []) if str(t).strip()]
 
 
+def _strs(v):
+    """字符串列表原样保留，不像 _tags 那样按标点拆开（锁/禁都是整句）。"""
+    if isinstance(v, str):
+        return [v.strip()] if v.strip() else []
+    return [str(x).strip() for x in (v or []) if str(x).strip()]
+
+
 def _read_meta(path):
     if not path or not os.path.isfile(path):
         if path:
@@ -929,6 +936,17 @@ def _card_entry(folder, meta):
         "parent": (meta.get("parent") or "").strip(),
         "file": os.path.relpath(os.path.join(folder, "panel.png"), USER_CARD_ROOT).replace("\\", "/"),
         "created": meta.get("created") or time.strftime("%Y-%m-%d"),
+        # ── 参数卡字段（有就带，没有不影响老符）──
+        "chain": (meta.get("chain") or "").strip(),
+        "locks": _strs(meta.get("locks")),
+        "variables": _strs(meta.get("variables")),
+        "negatives": _strs(meta.get("negatives")),
+        "defer": _strs(meta.get("defer")),
+        "grade": (meta.get("grade") or "").strip(),
+        "grade_basis": (meta.get("grade_basis") or "").strip(),
+        "score_total": (sum(v for v in (meta.get("score") or {}).values()
+                            if isinstance(v, (int, float)))
+                        if isinstance(meta.get("score"), dict) else 0),
     }
 
 
@@ -1063,6 +1081,8 @@ def cmd_lib(a):
                  if all(t in [str(x).lower() for x in (c.get("tags") or [])] for t in want)]
     if a.status:
         cards = [c for c in cards if (c.get("status") or "候选") == a.status]
+    if getattr(a, "grade", ""):
+        cards = [c for c in cards if (c.get("grade") or "").startswith(a.grade)]
 
     if a.show:
         c = next((x for x in all_cards() if a.show in (x.get("id"), x.get("name"))), None)
@@ -1075,6 +1095,18 @@ def cmd_lib(a):
         print("何时调：%s" % (c.get("call") or "（没写）"))
         print("状态　：%s%s" % (c.get("status") or "候选", " ［内置］" if c.get("_builtin") else ""))
         print("父系　：%s" % (c.get("parent") or "（无）"))
+        print("称号　：%s" % {"main": "主符（可直接当主符）",
+                              "aux": "辅符（给主符打补丁）"}.get(c.get("chain"), "（未标）"))
+        grade = c.get("grade") or ""
+        if grade:
+            print("评级　：%s  %d/100 ｜ %s" % (grade, c.get("score_total") or 0,
+                                            c.get("grade_basis") or "设计评级"))
+        else:
+            print("评级　：（未评）")
+        for k, label in (("locks", "锁（不可改）"), ("variables", "变（必须给）"),
+                         ("negatives", "禁（本符专属）"), ("defer", "让（交给下游）")):
+            v = c.get(k) or []
+            print("%-6s：%s" % (label, ("；".join(v) if v else "（未填）")))
         print("标签　：%s" % (" / ".join(c.get("tags") or []) or "（没打标签）"))
         f = os.path.join(c["_root"], c.get("file") or "")
         print("图　　：%s%s" % (f, "" if os.path.isfile(f) else "  ⚠ 图丢了"))
@@ -1087,8 +1119,9 @@ def cmd_lib(a):
     for c in cards:
         f = os.path.join(c["_root"], c.get("file") or "")
         mark = "［内置］" if c.get("_builtin") else ""
-        print("%s ｜ %s ［%s］%s" % (c.get("id"), c.get("name"),
-                                    c.get("status") or "候选", mark))
+        print("%s ｜ %s ［%s］%s%s" % (c.get("id"), c.get("name"),
+                                       c.get("status") or "候选", mark,
+                                       ("  " + c["grade"]) if c.get("grade") else ""))
         print("   %s" % (c.get("intro") or "（没写简介）"))
         print("   何时调：%s" % (c.get("call") or "（没写）"))
         if not os.path.isfile(f):
@@ -1215,6 +1248,7 @@ def main():
     p.add_argument("--tag", action="append", default=[])
     p.add_argument("--show", default="")
     p.add_argument("--status", default="", choices=["", "候选", "定稿", "弃用"])
+    p.add_argument("--grade", default="", help="按评级筛：S / A+ / A / B / C（A 会带出 A+）")
     p.add_argument("--add", default="")
     p.add_argument("--rm", default="")
     p.set_defaults(fn=cmd_lib)
