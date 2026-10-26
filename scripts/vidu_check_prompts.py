@@ -26,6 +26,8 @@
     normal 必须有 vm。锚点串与音色卡逐字一致 · 同一角色跨组一字不差。
 
 ★ 为什么有 J：闲时无法参考音色（实测），角色声线只能靠文字锚点串锁定。
+  ⚠ 注意区别：闲时**照样会生成配音**（平台原生配音逐句念台词）。
+  这一项拦的是「不该挂参考音频」，⛔ 不是「不该有台词」——把台词删掉同样算错。
   给了 --voice-dir 就对着卡文件核，没给就只核「有没有、齐不齐、跨组同不同」。
 
 退出码：0 通过｜1 有错误｜2 输入有问题
@@ -167,7 +169,7 @@ def check_voice(block, dia, mode, cards, bad, warn):
     if mode == "nopeak":
         if has_vm:
             bad("闲时（nopeak）不能挂参考音色：删掉 vm 行，改用【音色文字锁定】"
-                "（见 references/音色与配音.md）")
+                "（见 references/音色与配音.md）。⚠ 台词照念，别删台词")
         if speakers and not mod:
             bad("闲时稿必须有【音色文字锁定】：%s 这一组没锁声线" % "/".join(speakers))
         if mod and VOICE_STRICT_FIELD in block:
@@ -190,6 +192,11 @@ def check_voice(block, dia, mode, cards, bad, warn):
             elif anchor != cards[sp]:
                 bad("%s 锚点串与音色卡不一致：\n        稿子：%s\n        卡  ：%s"
                     % (sp, anchor, cards[sp]))
+
+    # ★ 2026-10-26：防止把「闲时不能参考音色」误读成「没声音」而删掉台词
+    if mod and not speakers:
+        warn("本组写了【音色文字锁定】却一句台词都没有 —— 是不是把台词删了？"
+             "闲时照样有原生配音，台词不该删；真要纯画面组，把音色模块整块去掉")
     return mod
 
 

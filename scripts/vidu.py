@@ -321,12 +321,15 @@ def build_video_payload(job, api, mode, cache):
                            % (dur, VIDU_MIN_SECONDS, VIDU_MAX_SECONDS))
     imgs = job.get("images") or []
     auds = job.get("audios") or []
-    # ★ 2026-10-26 实测：闲时（nopeak）无法参考音色 —— 提交前就拦，别等排完队才发现没生效
+    # ★ 2026-10-26 实测：闲时（nopeak）无法参考音色 —— 在提交前就拦，别等排完队才发现没生效
+    #   ⚠ 拦的是「参考音色」，不是「配音」：台词照样会被平台原生配音念出来，别顺手把台词删了
     if auds and mode == "nopeak":
         raise RuntimeError(
-            "闲时（nopeak）无法参考音色：本组登记了 %d 条音色。"
+            "闲时（nopeak）无法参考音色：本组登记了 %d 条音色（%s）。"
             "二选一：① 删掉 audios，把声线写进【音色文字锁定】（锚点串抄自 音色-<角色名>.txt）；"
-            "② 确需参考音色就改 --mode normal（花积分）。" % len(auds))
+            "② 确需参考音色就改 --mode normal（花积分）。"
+            "⚠ 只是不能指定声线，台词仍会由平台原生配音念出来，不要把台词删掉。"
+            % (len(auds), "、".join(str(_name_of(x) or _path_of(x) or "?") for x in auds)))
     if len(imgs) > MAX_IMAGES:
         raise RuntimeError("图片 %d 张 > %d 上限" % (len(imgs), MAX_IMAGES))
     if len(auds) > MAX_AUDIOS:

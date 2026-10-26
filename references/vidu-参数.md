@@ -135,10 +135,13 @@ GET /vidu/v1/tasks/quota  →  {"nopeak_quota": {"used": 200, "total": 200}}
 
 **闲时的能力边界（2026-10-26 更正）：**
 
+> ⚠️ **最容易理解反的一条：闲时不能"参考音色"，但一直在"出声"。**
+> 台词会由平台自带的语音模型**逐句念出来**。所以 ⛔ 不许因为"不能挂音色"就删台词、把整组写成纯画面。
+
 | 能力 | 闲时 | 说明 |
 |---|---|---|
+| **AI 配音念台词**（写 `角色名：台词`） | ✅ **可用** | ★ 平台**原生配音**，逐句念，中文；语气跟 `<>` 走。**这是默认状态，不是靠 `--audio` 才有声音** |
 | 音色参考 `--audio` | ❌ **无法参考** | ★ 实测：闲时挂参考音色也锁不住声线，成片仍由平台自选。**声线改用人物音色卡（文字）锁** —— 见 `references/音色与配音.md` |
-| AI 配音念台词 | ✅ 可用 | `{台词}` 照样会被念出来 |
 | 唇同步 / 音频驱动（`with_audio` + `lip_sync`） | ❌ | 报 `withaudio & lipsync nopeak mode is not allowed` |
 | 参考图生图 `r2i` | ❌ | 403 |
 | 文生图 `t2i` | ✅ 但**吃出片额度** | 不建议批量用 |
@@ -146,6 +149,7 @@ GET /vidu/v1/tasks/quota  →  {"nopeak_quota": {"used": 200, "total": 200}}
 > ⚠ **2026-10-21 那条「单纯 `--audio` 不受影响」的结论作废。** 现在本包在提交前直接拦：
 > `nopeak` 作业单里带 `audios` 会报「闲时（nopeak）无法参考音色」，不会白排一轮队。
 > 要真参考音色：`--mode normal`（花积分）。
+> 再强调一次：**被拦的是"参考音色"，不是"配音"** —— 台词照念，别删。
 
 **默认只走闲时。** 要走积分得用户明确说，别替他决定。
 
@@ -176,7 +180,7 @@ GET /vidu/v1/tasks/quota  →  {"nopeak_quota": {"used": 200, "total": 200}}
 | `Q4 does not support claw_pass` | 模式用错 | 改 `nopeak` / `normal` |
 | `duration X out of range` | 时长超界 | 参考生视频 1–16，图生视频 3–16 |
 | `Q4 character2video requires an image...` | 没给素材 | 至少一张图 |
-| `withaudio & lipsync nopeak mode is not allowed` | 闲时带了参考音频 / 开了 lip_sync | ★ **闲时无法参考音色**：删 `--audio`，声线改用【音色文字锁定】；真要参考音走 `normal` |
+| `withaudio & lipsync nopeak mode is not allowed` | 闲时带了参考音频 / 开了 lip_sync | ★ **闲时无法参考音色**：删 `--audio`，声线改用【音色文字锁定】；真要参考音走 `normal`。⚠ **台词照念，别删** |
 | `reference2image nopeak mode is not allowed` | r2i 用了闲时 | 生图走 `normal` |
 | `Invalid resolution` | 分辨率写错 | 用 `1080p` |
 | `INSUFFICIENT_CREDITS` | 积分不够 | 充值，或改走闲时 |
