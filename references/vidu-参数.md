@@ -133,15 +133,19 @@ GET /vidu/v1/tasks/quota  →  {"nopeak_quota": {"used": 200, "total": 200}}
 | 专业版 | 20 条 | 3 集 |
 | 旗舰版 | 200 条 | 30 集左右 |
 
-**闲时的能力边界（2026-10-21 实测）：**
+**闲时的能力边界（2026-10-26 更正）：**
 
 | 能力 | 闲时 | 说明 |
 |---|---|---|
-| 音色参考 `--audio` | ✅ 可用 | 让角色用指定声线说话 |
+| 音色参考 `--audio` | ❌ **无法参考** | ★ 实测：闲时挂参考音色也锁不住声线，成片仍由平台自选。**声线改用人物音色卡（文字）锁** —— 见 `references/音色与配音.md` |
 | AI 配音念台词 | ✅ 可用 | `{台词}` 照样会被念出来 |
 | 唇同步 / 音频驱动（`with_audio` + `lip_sync`） | ❌ | 报 `withaudio & lipsync nopeak mode is not allowed` |
 | 参考图生图 `r2i` | ❌ | 403 |
 | 文生图 `t2i` | ✅ 但**吃出片额度** | 不建议批量用 |
+
+> ⚠ **2026-10-21 那条「单纯 `--audio` 不受影响」的结论作废。** 现在本包在提交前直接拦：
+> `nopeak` 作业单里带 `audios` 会报「闲时（nopeak）无法参考音色」，不会白排一轮队。
+> 要真参考音色：`--mode normal`（花积分）。
 
 **默认只走闲时。** 要走积分得用户明确说，别替他决定。
 
@@ -172,7 +176,7 @@ GET /vidu/v1/tasks/quota  →  {"nopeak_quota": {"used": 200, "total": 200}}
 | `Q4 does not support claw_pass` | 模式用错 | 改 `nopeak` / `normal` |
 | `duration X out of range` | 时长超界 | 参考生视频 1–16，图生视频 3–16 |
 | `Q4 character2video requires an image...` | 没给素材 | 至少一张图 |
-| `withaudio & lipsync nopeak mode is not allowed` | 闲时开了 lip_sync | 关 lip_sync；单纯 `--audio` 不受影响 |
+| `withaudio & lipsync nopeak mode is not allowed` | 闲时带了参考音频 / 开了 lip_sync | ★ **闲时无法参考音色**：删 `--audio`，声线改用【音色文字锁定】；真要参考音走 `normal` |
 | `reference2image nopeak mode is not allowed` | r2i 用了闲时 | 生图走 `normal` |
 | `Invalid resolution` | 分辨率写错 | 用 `1080p` |
 | `INSUFFICIENT_CREDITS` | 积分不够 | 充值，或改走闲时 |

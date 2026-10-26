@@ -22,6 +22,11 @@
   G 格式：每句台词后紧跟 `<>`，且以「保持<角色名>的音色不变，」开头
   H 正文：无 `《》` 剩余占位 · 无未替换变量 · 不空
   I 规范：无内部工作痕迹（主镜头锚点 / 沿用上一组站位）· 无禁用音色词
+  J 音色通道（★ 2026-10-26 新增）：闲时（nopeak）不许挂 vm，必须有【音色文字锁定】；
+    normal 必须有 vm。锚点串与音色卡逐字一致 · 同一角色跨组一字不差。
+
+★ 为什么有 J：闲时无法参考音色（实测），角色声线只能靠文字锚点串锁定。
+  给了 --voice-dir 就对着卡文件核，没给就只核「有没有、齐不齐、跨组同不同」。
 
 退出码：0 通过｜1 有错误｜2 输入有问题
 """
@@ -49,7 +54,10 @@ DUR = re.compile(r"分镜组时长：\s*(\d+(?:\.\d+)?)\s*(?:秒|s)?")
 TITLE = re.compile(r"^\s*第\s*\d+\s*集\s*[·:：]\s*《[^》]+》\s*$")
 DIALOGUE = re.compile(r"([^\s：:<>\n【】]{1,12})：\s*([^<>\n]+?)\s*<([^<>]+)>")
 DIRECTION = re.compile(r"^<(.+)>$")
-BAD_WORDS = ["主镜头锚点", "沿用上一组站位", "磁性嗓音", "少女音", "御姐音", "烟嗓", "播音腔"]
+BAD_WORDS = ["主镜头锚点", "沿用上一组站位", "磁性嗓音", "少女音", "御姐音", "烟嗓", "播音腔",
+             "气泡音", "贵族腔", "声音变老", "低音炮", "奶音"]
+VOICE_MOD_FIELD = "【音色文字锁定】"
+VOICE_STRICT_FIELD = "【音色严格规范】"
 
 SELF_FIELDS = ["【基础信息】", "【统一风格模块】", "【强制声明】", "【资产盘点】", "【提示词正文】"]
 STD_FIELDS = ["【基础信息】", "【统一风格模块】", "【强制声明】", "【资产盘点】", "【提示词正文】",
@@ -106,6 +114,85 @@ def cjk(s):
     return len(CJK.findall(s or ""))
 
 
+# ─────────────────────── 音色通道（J） ───────────────────────
+ANCHOR_LINE = re.compile(r"^([^\s：:<>【】《》（）]{1,12})：\s*(.+?)\s*$")
+
+
+def parse_voice_module(block):
+    """取【音色文字锁定】里的 {角色: 锚点串}。"""
+    m = re.search(re.escape(VOICE_MOD_FIELD) + r"\s*\n(.*?)(?=\n【|\n&&end|\Z)", block, re.S)
+    if not m:
+        return {}
+    out = {}
+    for line in m.group(1).split("\n"):
+        s = line.strip()
+        if not s or s.startswith(("【", "《", "·", "-", "本组无参考音频")):
+            continue
+        mm = ANCHOR_LINE.match(s)
+        if not mm:
+            continue
+        name, anchor = mm.group(1).strip(), mm.group(2).strip()
+        if "，" in name or "。" in name or "/" in name:
+            continue
+        out[name] = anchor
+    return out
+
+
+def load_voice_cards(path):
+    """读 _资产提示词/音色-*.txt → {角色名: 锚点串}。"""
+    cards = {}
+    if not path or not os.path.isdir(path):
+        return cards
+    for fn in os.listdir(path):
+        if not fn.startswith("音色-") or not fn.lower().endswith(".txt"):
+            continue
+        name = os.path.splitext(fn)[0][len("音色-"):].strip()
+        txt = open(os.path.join(path, fn), encoding="utf-8", errors="ignore").read()
+        m = re.search(r"锚点串[：:]\s*(.+)", txt)
+        if m:
+            cards[name] = m.group(1).strip()
+    return cards
+
+
+def check_voice(block, dia, mode, cards, bad, warn):
+    """J：闲时不许 vm；必须有锚点串；锚点串要对得上卡。返回 {角色: 锚点}"""
+    vms = re.findall(r"vm(\d+),\s*([^=@，,\n]+?)\s*=@", block)
+    has_vm = bool(vms) and "人物音色资产：无" not in block
+    speakers = []
+    for sp, _t, _d in dia:
+        if sp and sp not in speakers:
+            speakers.append(sp)
+    mod = parse_voice_module(block)
+
+    if mode == "nopeak":
+        if has_vm:
+            bad("闲时（nopeak）不能挂参考音色：删掉 vm 行，改用【音色文字锁定】"
+                "（见 references/音色与配音.md）")
+        if speakers and not mod:
+            bad("闲时稿必须有【音色文字锁定】：%s 这一组没锁声线" % "/".join(speakers))
+        if mod and VOICE_STRICT_FIELD in block:
+            bad("【音色严格规范】与【音色文字锁定】不能同时出现（一个走参考音，一个走文字）")
+        for sp in speakers:
+            if mod and sp not in mod:
+                bad("【音色文字锁定】缺发言角色：%s" % sp)
+    elif mode == "normal":
+        if speakers and not has_vm:
+            bad("normal 通道有台词却没登记 vm 行（有参考音色就写 `人物音色资产：vm1,<名>=@`）")
+        if mod:
+            warn("normal 通道同时出现【音色文字锁定】，确认不是混模板")
+
+    for sp, anchor in mod.items():
+        if len(anchor) > 40:
+            warn("%s 锚点串 %d 字 > 40，建议压短（每组都要抄一遍）" % (sp, len(anchor)))
+        if cards:
+            if sp not in cards:
+                bad("%s 没有音色卡（--voice-dir 下应有 音色-%s.txt）" % (sp, sp))
+            elif anchor != cards[sp]:
+                bad("%s 锚点串与音色卡不一致：\n        稿子：%s\n        卡  ：%s"
+                    % (sp, anchor, cards[sp]))
+    return mod
+
+
 # ─────────────────────── 校验 ───────────────────────
 def check_self(block, bad, warn):
     for k in SELF_FIELDS:
@@ -153,7 +240,8 @@ def check_std(block, bad, warn):
     return body, shots, total
 
 
-def check_group(block, asset_names, panel_names, old_counter, bad, warn, note):
+def check_group(block, asset_names, panel_names, old_counter, bad, warn, note,
+                voice_mode="auto", voice_cards=None):
     gid_m = GROUP_ID.search(block)
     if not gid_m:
         bad("缺 分镜组ID")
@@ -256,6 +344,16 @@ def check_group(block, asset_names, panel_names, old_counter, bad, warn, note):
         bad("无台词却登记了人物音色资产")
     if not dia and "【音色严格规范】" in block:
         bad("无台词却输出了【音色严格规范】")
+    if not dia and VOICE_MOD_FIELD in block:
+        bad("无台词却输出了【音色文字锁定】")
+
+    # J 音色通道
+    if voice_mode == "auto":
+        eff_mode = ("normal" if (re.search(r"vm\d+,", block) and "人物音色资产：无" not in block)
+                    else "nopeak")
+    else:
+        eff_mode = voice_mode
+    anchors = check_voice(block, dia, eff_mode, voice_cards, bad, warn)
 
     # 正文体量
     if dur and len(body) > MAX_CHARS:
@@ -272,7 +370,8 @@ def check_group(block, asset_names, panel_names, old_counter, bad, warn, note):
 
     return {"gid": gid, "tpl": tpl, "dur": dur, "lines": len(dia),
             "chars": sum(cjk(t) for _s, t, _d in dia), "pn": len(set(pns)),
-            "vm": len(vms), "speakers": speakers,
+            "vm": len(vms), "speakers": speakers, "mode": eff_mode,
+            "anchors": anchors,
             "dialogue": [t for _s, t, _d in dia]}
 
 
@@ -284,8 +383,17 @@ def main():
     ap.add_argument("--asset-dir", default="", help="资产图目录（给了才查资产是否存在）")
     ap.add_argument("--panel-dir", default="", help="常用符目录（给了才查符是否存在）")
     ap.add_argument("--strict", action="store_true", help="警告也算不过")
+    ap.add_argument("--voice-mode", choices=["auto", "nopeak", "normal"], default="auto",
+                    help="音色通道：auto=有 vm 行算 normal，没有算 nopeak（默认）")
+    ap.add_argument("--voice-dir", default="",
+                    help="音色卡目录（…/00_剧本与提示词/_资产提示词）：给了就核锚点串与卡逐字一致")
     ap.add_argument("--json", default="", help="结果另存 JSON")
     a = ap.parse_args()
+
+    if not a.voice_dir and a.project:
+        cand = os.path.join(a.project, "00_剧本与提示词", "_资产提示词")
+        if os.path.isdir(cand):
+            a.voice_dir = cand
 
     files = []
     if a.new:
@@ -317,6 +425,10 @@ def main():
                 panel_names.add(n)
             elif n.lower().endswith(".png"):
                 panel_names.add(os.path.splitext(n)[0])
+
+    voice_cards = load_voice_cards(a.voice_dir)
+    if a.voice_dir and not voice_cards:
+        print("⚠ --voice-dir 里没读到 音色-*.txt（%s）" % a.voice_dir)
 
     err, warn_all = [], []
     rows, all_new = [], []
@@ -360,7 +472,8 @@ def main():
                     (GROUP_ID.search(b).group(1) if GROUP_ID.search(b) else "?"), m)),
                 lambda m: local_warn.append("[%s] %s" % (
                     (GROUP_ID.search(b).group(1) if GROUP_ID.search(b) else "?"), m)),
-                lambda *_: None)
+                lambda *_: None,
+                voice_mode=a.voice_mode, voice_cards=voice_cards)
             err.extend(local_err)
             warn_all.extend(local_warn)
             rows.append(info)
@@ -368,6 +481,16 @@ def main():
 
         print("  组 %d ｜ 模板 %s" % (len(blocks),
                                    "/".join(sorted(set(r["tpl"] for r in rows[-len(blocks):])))))
+
+    # ── J2 同一角色跨组锚点串必须一字不差
+    seen = {}
+    for r in rows:
+        for sp, anchor in (r.get("anchors") or {}).items():
+            seen.setdefault(sp, collections.OrderedDict()).setdefault(anchor, []).append(r["gid"])
+    for sp, variants in seen.items():
+        if len(variants) > 1:
+            detail = "；".join("%s ×%d" % (k, len(v)) for k, v in variants.items())
+            err.append("音色锚点跨组不一致（%s）：%s" % (sp, detail))
 
     # 台词逐字多重集
     if old_counter is not None:
@@ -382,11 +505,13 @@ def main():
         print("旧台词 %d 条 ｜ 新台词 %d 条" % (sum(old_counter.values()), sum(cn.values())))
 
     print("")
-    print("%-14s %-6s %-5s %-5s %-4s %-4s %s" % ("组号", "模板", "时长", "台词", "字", "图", "发言"))
+    print("%-14s %-6s %-5s %-5s %-4s %-4s %-7s %s"
+          % ("组号", "模板", "时长", "台词", "字", "图", "通道", "发言"))
     for r in rows:
-        print("%-14s %-6s %-5s %-5d %-4d %-4d %s"
+        print("%-14s %-6s %-5s %-5d %-4d %-4d %-7s %s"
               % (r["gid"], r["tpl"], r["dur"] if r["dur"] is not None else "-",
-                 r["lines"], r["chars"], r["pn"], "/".join(r["speakers"]) or "—"))
+                 r["lines"], r["chars"], r["pn"],
+                 r.get("mode", "-"), "/".join(r["speakers"]) or "—"))
 
     print("")
     if err:
