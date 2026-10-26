@@ -1,11 +1,11 @@
 @echo off
 chcp 65001 >nul
-title VIDU-CLI-SKILL - 初始化
+title vidu-skill - 初始化
 cd /d "%~dp0"
 setlocal
 
 echo ============================================================
-echo   VIDU-CLI-SKILL  一次性环境检查
+echo   vidu-skill  一次性环境检查
 echo   跑一次就好，以后不用再跑
 echo ============================================================
 echo.

@@ -135,8 +135,11 @@ python scripts/asset_init.py 我的项目
 
 ## 装进你的 AI（复制这段发给它）
 
+> ★ **两个名字不是一回事**：GitHub 仓库叫 `VIDU-CLI-SKILL`，装出来的**文件夹必须叫 `vidu-skill`**。
+> 文件夹名一改，`SKILL.md` 里的 `name` 就对不上，有些客户端会认不出来。
+
 ````
-帮我装一个 skill：vidu-skill
+帮我装一个 skill：vidu-skill（仓库名是 VIDU-CLI-SKILL，别搞混）
 仓库：https://github.com/Zeno-Zhu/VIDU-CLI-SKILL.git
 
 1. 直接 clone 成 skills 目录下的 vidu-skill，**文件夹名必须是 vidu-skill**：
@@ -154,6 +157,8 @@ python scripts/asset_init.py 我的项目
 
 4. 引导我打开 vidu.cn，点左下角头像，找到「Vidu Token」，复制发给你。
    我要是找不到，把 assets/vidu-token.png 发给我看。
+   注意：如果这台机器以前装过旧版，`~/.vidu-cli-skill/token.txt` 还在的话，
+   `--check` 会直接通过（显示"已经配过了"），这一步就可以跳过。
 ````
 
 拉不下来的话，换成 SSH 地址或者镜像再试，别卡在这一步。

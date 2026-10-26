@@ -1,10 +1,10 @@
 {
  "package": "vidu-skill",
  "display": "VIDU-CLI-SKILL（公开包）",
- "version": "2.3.0",
- "built_at": "2026-10-26 17:32:38",
+ "version": "2.3.1",
+ "built_at": "2026-10-26 19:00:10",
  "source_repo": "manju-vidu-workflow (A)",
- "source_commit": "3cc7455",
+ "source_commit": "0c91ada",
  "profile": "packages\\B\\profile.json",
  "divergent": [
   "SKILL.md",
