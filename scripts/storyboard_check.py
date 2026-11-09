@@ -13,14 +13,15 @@
 ③ **结构三列**（L1 精简）：分镜组ID / 时长 / 原剧本锚点  ← 只能做组级检查，逐镜项自动跳过
 
 判据（唯一口径，见 references/vidu-参数.md）：
-  · 组时长 ≤ 16 秒（硬线）；< 6 秒判碎片；6—12 秒提示能合就合
+  · 组时长 ≤ 16 秒（硬线）；< 6 秒判碎片；6—12 秒提示「能合就合」（一集最多一两组短组）
   · 单镜 ≥ 1.2 秒（硬下限，无例外）
-  · 一组 2—6 镜，推荐 3—5
+  · 一组优先 4—8 镜，不设死线（<2 判不成立，>8 看内容撑不撑）
   · 空镜+氛围：单组 > 40% 警告；全片 > 25% 警告
   · 单个无水词氛围镜 > 4.5 秒警告
   · 连续 3 镜同景别 / 同机位 / 同运镜 警告（固定机位不算运镜重复）
   · 全片单一景别 > 55% 警告
   · 台词 > 组时长 × 4 字 警告
+  · 站位：有站位列时，组内第一镜必须写全，缺了警告
 
 退出码：0 通过（可有警告）｜1 有错误｜2 表读不进来
 """
@@ -31,16 +32,25 @@ import os
 import re
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import channel_profile as CP  # noqa: E402
+
 MAX_GROUP = 16.0
 TARGET_LOW = 12.0
-HARD_LOW = 6.0
+HARD_LOW = 4.0
 MIN_SHOT = 1.2
-MAX_SHOTS = 6
+SHOT_GUIDE_LOW = 4      # 建议线，不是死线
+SHOT_GUIDE_HIGH = 10    # 建议线，不是死线
 EMPTY_RATIO_GROUP = 0.40
 EMPTY_RATIO_ALL = 0.25
 EMOTION_MAX = 4.5
 SIZE_DOMINANT = 0.55
 CHARS_PER_SEC = 4.0
+
+ASSET_NAMES = set()
+REQUIRE_ASSETS = False
+ASSET_COL = False
+FIXED_DUR = None
 
 HEADER_ALIAS = {
     "组号": ["组号", "组", "分镜组", "分镜组id", "group", "组id"],
@@ -52,7 +62,8 @@ HEADER_ALIAS = {
     "功能": ["功能", "类型", "镜别", "用途"],
     "内容": ["内容", "画面", "画面内容", "描述", "剧情", "画面与表演"],
     "台词": ["台词", "对白", "语音", "说话", "口播", "旁白"],
-    "资产": ["资产", "素材", "参考", "引用"],
+    "资产": ["出场资产", "资产", "素材", "参考", "引用"],
+    "站位": ["站位", "走位", "调度", "人物位置", "blocking"],
     "落点": ["视觉落点", "落点"],
     "锚点": ["原剧本锚点", "锚点", "剧本锚点"],
     "状态": ["状态变化", "状态"],
@@ -100,7 +111,8 @@ def norm_move(raw):
 
 
 class Shot(object):
-    def __init__(self, group, name, dur, size, angle, func, content, line, assets, row, move=None):
+    def __init__(self, group, name, dur, size, angle, func, content, line, assets, row,
+                 move=None, block=""):
         self.group = group
         self.name = name
         self.dur = dur
@@ -112,6 +124,7 @@ class Shot(object):
         self.assets = assets
         self.row = row
         self.move = move
+        self.block = block
 
 
 def to_float(v):
@@ -238,7 +251,8 @@ def build_shots(rows, idx):
             notes.append("第 %d 行：%s" % (n, note))
         shots.append(Shot(g, name, dur, norm_size(get("景别")), get("角度"),
                           func, get("内容"), line, assets, n,
-                          norm_move(get("运镜")) if has_move else None))
+                          norm_move(get("运镜")) if has_move else None,
+                          get("站位") if "站位" in idx else None))
     return shots, notes
 
 
@@ -267,12 +281,14 @@ def check_groups_only(rows, idx):
 
     total = sum(d for _, d, _ in groups) or 1e-9
     for g, d, anchor in groups:
+        if FIXED_DUR and abs(d - float(FIXED_DUR)) > 1e-6:
+            errs.append("组 %s：%.1fs ≠ 固定 %.0fs（本渠道固定档）" % (g, d, float(FIXED_DUR)))
         if d > MAX_GROUP + 1e-6:
             errs.append("组 %s：%.1fs 超过 %.0fs 上限 —— 拆组，别硬压" % (g, d, MAX_GROUP))
         elif d < HARD_LOW:
-            errs.append("组 %s：%.1fs 太短 —— 至少 %.0fs，最好 12—16s" % (g, d, HARD_LOW))
+            errs.append("组 %s：%.1fs 太短 —— 低于 %.0fs 判碎片" % (g, d, HARD_LOW))
         elif d < TARGET_LOW - 1e-6:
-            warns.append("组 %s：%.1fs 低于 12s —— 能合就并进相邻组" % (g, d))
+            warns.append("组 %s：%.1fs 低于优先档 %.0fs —— 一集最多一两组短组" % (g, d, TARGET_LOW))
         if not anchor:
             warns.append("组 %s：没写原剧本锚点 —— 后面改词无法回溯" % g)
     if groups:
@@ -294,8 +310,11 @@ def group_shots(shots):
 
 def check(shots):
     errs, warns, infos = [], [], []
+    if REQUIRE_ASSETS and not ASSET_COL:
+        errs.append("表头没有「出场资产」列 —— P5 必须写出场资产，否则 P6 无法绑定")
     groups = group_shots(shots)
     has_move = any(s.move is not None for s in shots)
+    has_block = any(s.block is not None for s in shots)
     has_dur = all(s.dur is not None for s in shots)
 
     total_all = sum(s.dur or 0 for s in shots) or 1e-9
@@ -310,20 +329,42 @@ def check(shots):
         total = sum(s.dur or 0 for s in ss)
         tag = "组 %s" % g
 
+        if ASSET_COL:
+            used = []
+            for s in ss:
+                for tok in re.split(r"[,，、;；\s]+", (s.assets or "").strip()):
+                    if tok and tok not in used:
+                        used.append(tok)
+            if not used:
+                errs.append("%s：出场资产列为空 —— 每组必填（角色 / 场景 / 道具）" % tag)
+            for tok in used:
+                base = re.split(r"[：:]", tok)[0]
+                if ASSET_NAMES and base not in ASSET_NAMES:
+                    errs.append("%s：出场资产「%s」不在资产清单里" % (tag, base))
+        elif REQUIRE_ASSETS:
+            pass
+
         if has_dur:
+            if FIXED_DUR and abs(total - float(FIXED_DUR)) > 1e-6:
+                errs.append("%s：%.1fs ≠ 固定 %.0fs（本渠道固定档）" % (tag, total, float(FIXED_DUR)))
             if total > MAX_GROUP + 1e-6:
                 errs.append("%s：组时长 %.1fs 超过 %.0fs 上限 —— 拆组，别硬压" % (tag, total, MAX_GROUP))
             elif total < HARD_LOW:
-                errs.append("%s：组时长 %.1fs 太短 —— 至少 %.0fs，最好 12—16s" % (tag, total, HARD_LOW))
+                errs.append("%s：组时长 %.1fs 太短 —— 低于 %.0fs 判碎片" % (tag, total, HARD_LOW))
             elif total < TARGET_LOW - 1e-6:
-                warns.append("%s：组时长 %.1fs 低于 12s —— 能合就并进相邻组" % (tag, total))
+                warns.append("%s：组时长 %.1fs 低于优先档 %.0fs —— 一集最多一两组短组" % (tag, total, TARGET_LOW))
         else:
             total = 1e-9
 
         if len(ss) < 2:
-            errs.append("%s：只有 1 个分镜 —— 一组至少要 2 镜，推荐 3—5 镜" % tag)
-        elif len(ss) > MAX_SHOTS:
-            warns.append("%s：%d 个分镜偏多 —— 单镜会碎到 2s 以下，建议 3—5 镜" % (tag, len(ss)))
+            errs.append("%s：只有 1 个分镜 —— 一组至少 2 镜" % tag)
+        elif len(ss) < SHOT_GUIDE_LOW:
+            warns.append("%s：只有 %d 个分镜，偏少（建议 4 镜以上）—— 若是短组或一镜到底可以留，"
+                         "否则看看能不能补反应镜" % (tag, len(ss)))
+        elif len(ss) > SHOT_GUIDE_HIGH:
+            avg = (total / len(ss)) if total > 1 else 0
+            warns.append("%s：%d 个分镜，超过建议上限 %d（平均 %.1fs 一镜）—— "
+                         "确认每镜都有独立信息，不是为碎而碎" % (tag, len(ss), SHOT_GUIDE_HIGH, avg))
 
         names = [s.name for s in ss]
         dup = set(n for n in names if names.count(n) > 1)
@@ -372,6 +413,15 @@ def check(shots):
                                  % (tag, ss[i].name, ss[i].move))
                     run_move = 1
 
+        if has_block:
+            # 站位预演：组内第一镜必须写全（谁在哪、朝哪、机位在哪侧），后面可只写变化
+            if not (ss[0].block or "").strip():
+                warns.append("%s/%s：组内第一镜没写站位 —— 先做站位预演（谁在哪、朝哪、机位在轴线哪侧）"
+                             % (tag, ss[0].name))
+            miss = [s.name for s in ss[1:] if not (s.block or "").strip()]
+            if miss and len(miss) == len(ss) - 1:
+                warns.append("%s：整组只有第一镜有站位 —— 后面每镜至少写「变了什么」" % tag)
+
         kinds = set(s.size for s in ss if s.size)
         if len(kinds) < 2 and len(ss) >= 3:
             warns.append("%s：%d 个分镜只用了一种景别 —— 至少给一个反差镜" % (tag, len(ss)))
@@ -401,12 +451,45 @@ def check(shots):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="分镜组表体检：时长 / 粒度 / 空镜 / 景别角度 / 运镜")
+    global MAX_GROUP, TARGET_LOW, HARD_LOW, SHOT_GUIDE_HIGH, ASSET_NAMES, REQUIRE_ASSETS, ASSET_COL, FIXED_DUR
+    ap = argparse.ArgumentParser(description="分镜组表体检：时长 / 粒度 / 空镜 / 景别角度 / 运镜 / 出场资产")
     ap.add_argument("table", help="分镜组表（.tsv / .md / .csv）")
     ap.add_argument("--json", default="", help="把体检结果另存成 JSON")
-    ap.add_argument("--strict", action="store_true", help="警告也算不过")
+    ap.add_argument("--strict", action="store_true", help="警告也算不过（退出码 1）")
     ap.add_argument("--quiet", action="store_true", help="只打结论，不打每组明细")
+    ap.add_argument("--config", default="", help="项目配置.json；不给就向上找")
+    ap.add_argument("--max-group", type=float, default=None, help="覆盖单组上限（秒）")
+    ap.add_argument("--min-group", type=float, default=None, help="覆盖组最小（秒）")
+    ap.add_argument("--prefer-min", type=float, default=None, help="覆盖优先档下限（秒）")
+    ap.add_argument("--shot-max", type=int, default=None, help="覆盖镜数建议上限（只告警）")
+    ap.add_argument("--assets", default="", help="资产清单.json：给了就核出场资产名")
+    ap.add_argument("--require-assets", action="store_true", help="没有出场资产列即判错")
     a = ap.parse_args()
+
+    cfg_path = a.config or CP.find_config(a.table)
+    if cfg_path and os.path.isfile(cfg_path):
+        p = CP.load_config(cfg_path)
+        MAX_GROUP = float(p["group_max_s"])
+        HARD_LOW = float(p["group_min_s"])
+        TARGET_LOW = float((p.get("group_prefer_s") or [HARD_LOW])[0])
+        SHOT_GUIDE_HIGH = int(p.get("shots_soft_max", SHOT_GUIDE_HIGH))
+        FIXED_DUR = p.get("fixed_duration_s")
+    if a.max_group is not None:
+        MAX_GROUP = a.max_group
+    if a.min_group is not None:
+        HARD_LOW = a.min_group
+    if a.prefer_min is not None:
+        TARGET_LOW = a.prefer_min
+    if a.shot_max is not None:
+        SHOT_GUIDE_HIGH = a.shot_max
+    if a.assets:
+        if not os.path.isfile(a.assets):
+            print("[BLOCK] 找不到资产清单：%s" % a.assets)
+            return 2
+        inv = json.load(open(a.assets, encoding="utf-8"))
+        ASSET_NAMES = {x.get("name") for x in inv.get("assets", []) if x.get("name")}
+        ASSET_NAMES |= {x.get("id") for x in inv.get("assets", []) if x.get("id")}
+    REQUIRE_ASSETS = a.require_assets
 
     if not os.path.isfile(a.table):
         print("找不到文件：%s" % a.table)
@@ -417,10 +500,13 @@ def main():
         print("[表读不进来] %s" % e)
         return 2
 
+    ASSET_COL = "资产" in idx
     print("分镜组表体检  %s" % a.table)
 
     if group_only:
         errs, warns, infos, groups = check_groups_only(rows, idx)
+        if REQUIRE_ASSETS:
+            errs.insert(0, "三列结构表没有「出场资产」列 —— P5 必须写，否则 P6 无法绑定")
         print("组 %d（三列结构表）" % len(groups))
         if not a.quiet:
             print("")
@@ -475,13 +561,13 @@ def main():
 
     print("")
     if errs:
-        print("结论：%d 处错误，先改。" % len(errs))
+        print("结论：%d 处结构错误（BLOCK），先改。" % len(errs))
     elif warns and a.strict:
-        print("结论：无错误，但 %d 条警告；--strict 下判不通过。" % len(warns))
+        print("结论：无结构错误，但 %d 条警告；--strict 下判不通过。" % len(warns))
     elif warns:
-        print("结论：过线。%d 条警告可以改，也可以留。" % len(warns))
+        print("结论：PASS。%d 条警告可以改，也可以留。" % len(warns))
     else:
-        print("结论：干净。")
+        print("结论：PASS，干净。")
 
     if a.json:
         payload = {
@@ -508,7 +594,7 @@ def main():
         print("体检结果已存：%s" % a.json)
 
     if errs:
-        return 1
+        return 2
     if warns and a.strict:
         return 1
     return 0

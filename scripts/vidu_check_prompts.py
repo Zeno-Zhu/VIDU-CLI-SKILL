@@ -18,7 +18,8 @@
   C 时长：整数秒 1—16（目标 12—16，<12 只提醒）；标准模板还需「各镜时长之和 = 组时长」
   D 资产：pn 连续且 ≤9 · vm ≤3 · 资产名存在（给了 --asset-dir / --panel-dir 才查）
   E 音色：有独立音色的发言者 ≤3 · vm 与发言角色一致 · 无台词不许有音色块
-  F 台词：新旧逐字多重集完全一致（给了 --old 才查）
+  F 台词：新旧逐字多重集完全一致（给了 --old 才查）；
+          给了 --script 时，每句台词必须能在剧本原文里连续找到（⛔ 改字/加词/换归属 = 阻断）
   G 格式：每句台词后紧跟 `<>`，且以「保持<角色名>的音色不变，」开头
   H 正文：无 `《》` 剩余占位 · 无未替换变量 · 不空
   I 规范：无内部工作痕迹（主镜头锚点 / 沿用上一组站位）· 无禁用音色词
@@ -31,7 +32,7 @@
   ★ 有【音色文字锁定】却全组无台词 ⇒ **阻断**（防把"不能参考音色"误读成"不能对话"而删台词）。
   给了 --voice-dir 就对着卡文件核，没给就只核「有没有、齐不齐、跨组同不同」。
 
-退出码：0 通过｜1 有错误｜2 输入有问题
+退出码：0 PASS（告警只呈现）｜2 BLOCK（结构错）｜1 仅 --strict 下告警也算失败
 """
 from __future__ import annotations
 
@@ -43,10 +44,13 @@ import os
 import re
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import channel_profile as CP  # noqa: E402
+
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
 
 MIN_SEC, MAX_SEC, TARGET_LOW = 1, 16, 12
-MAX_IMAGES, MAX_AUDIOS, MAX_CHARS = 9, 3, 2000
+MAX_IMAGES, MAX_AUDIOS, MAX_CHARS = 9, 3, 8000
 
 FORCE = ("【强制声明】无背景音乐；画面无字幕/台词文字/水印/Logo/角标/UI；声音：不要配乐，仅保留同期声；"
          "全程无背景音乐，仅保留真实环境音效与动作同期声。")
@@ -68,6 +72,36 @@ STD_FIELDS = ["【基础信息】", "【统一风格模块】", "【强制声明
 STD_SHOT_FIELDS = ["时长：", "景别：", "拍摄方式与视角：", "运镜：", "构图：",
                    "角色台词：", "音频提示词："]
 STD_SHOT_FIELDS_OPT = ["肢体动作", "对标影视特效参考"]
+
+
+# ─────────────────────── 台词对账（对剧本原文） ───────────────────────
+def norm_line(t):
+    """只留汉字/字母/数字，去掉舞台标记（VO）（画外）与一切标点空白。"""
+    t = re.sub(r"[（(][^）)]{0,12}[）)]", "", t or "")
+    t = t.lower()
+    return re.sub(r"[^\u4e00-\u9fff0-9a-z]", "", t)
+
+
+def check_against_script(script_text, dialogue, bad, warn):
+    """每句台词必须能在剧本原文里连续找到 ⇒ 改字/加词/换顺序/换人一律抓出来。"""
+    hay = norm_line(script_text)
+    if not hay:
+        warn("--script 里没有可对账的文字（空文件或全是符号），本次跳过台词对账")
+        return 0
+    n = 0
+    for t in dialogue:
+        needle = norm_line(t)
+        if len(needle) < 2:
+            continue
+        n += 1
+        if needle in hay:
+            continue
+        parts = [x for x in (norm_line(x) for x in re.split(r"[。！？!?；;…\s]+", t)) if len(x) >= 2]
+        if parts and all(x in hay for x in parts):
+            warn("台词疑似把两句并成一句（字没改，是断句变了）：%s" % t[:24])
+            continue
+        bad("台词在剧本原文里找不到（疑似改字 / 加词 / 换归属）：%s" % t[:30])
+    return n
 
 
 # ─────────────────────── 读文件 ───────────────────────
@@ -366,7 +400,7 @@ def check_group(block, asset_names, panel_names, old_counter, bad, warn, note,
     anchors = check_voice(block, dia, eff_mode, voice_cards, bad, warn)
 
     # 正文体量
-    if dur and len(body) > MAX_CHARS:
+    if dur and MAX_CHARS and len(body) > MAX_CHARS:
         bad("正文 %d 字 > %d 上限" % (len(body), MAX_CHARS))
     if "《" in body or "》" in body:
         bad("正文残留《》占位")
@@ -386,6 +420,7 @@ def check_group(block, asset_names, panel_names, old_counter, bad, warn, note,
 
 
 def main():
+    global MIN_SEC, MAX_SEC, TARGET_LOW, MAX_CHARS, MAX_IMAGES
     ap = argparse.ArgumentParser(description="Vidu 提示词结构门（自己人 / 标准 双模板）")
     ap.add_argument("--new", default="", help="要校验的稿子")
     ap.add_argument("--old", default="", help="改写前的旧稿（台词逐字对账基准）")
@@ -397,8 +432,26 @@ def main():
                     help="音色通道：auto=有 vm 行算 normal，没有算 nopeak（默认）")
     ap.add_argument("--voice-dir", default="",
                     help="音色卡目录（…/00_剧本与提示词/_资产提示词）：给了就核锚点串与卡逐字一致")
+    ap.add_argument("--script", default="",
+                    help="剧本原文（_剧本全文.txt）：给了就逐句核对台词一字未改")
+    ap.add_argument("--config", default="", help="项目配置.json：读 profile 的提示词上限")
+    ap.add_argument("--max-chars", type=int, default=-1, help="覆盖提示词上限；0 = 不设上限")
     ap.add_argument("--json", default="", help="结果另存 JSON")
     a = ap.parse_args()
+
+    cfg_path = a.config or CP.find_config(a.new or a.project or ".")
+    if cfg_path and os.path.isfile(cfg_path):
+        try:
+            p = CP.load_config(cfg_path)
+            MIN_SEC = int(p["group_min_s"])
+            MAX_SEC = int(p["group_max_s"])
+            TARGET_LOW = int((p.get("group_prefer_s") or [MIN_SEC])[0])
+            MAX_CHARS = int(p["prompt_max_chars"] or 0)
+            MAX_IMAGES = int(p.get("max_images", 9))
+        except Exception as e:
+            print("⚠ 项目配置读取失败：%s" % e)
+    if a.max_chars >= 0:
+        MAX_CHARS = a.max_chars
 
     if not a.voice_dir and a.project:
         cand = os.path.join(a.project, "00_剧本与提示词", "_资产提示词")
@@ -439,6 +492,14 @@ def main():
     voice_cards = load_voice_cards(a.voice_dir)
     if a.voice_dir and not voice_cards:
         print("⚠ --voice-dir 里没读到 音色-*.txt（%s）" % a.voice_dir)
+
+    script_text = None
+    if a.script:
+        if not os.path.isfile(a.script):
+            print("[ERROR] 剧本原文不存在：%s" % a.script)
+            return 2
+        script_text = open(a.script, encoding="utf-8-sig", errors="replace").read()
+        print("台词对账基准：%s（%d 字）" % (a.script, len(script_text)))
 
     err, warn_all = [], []
     rows, all_new = [], []
@@ -484,6 +545,12 @@ def main():
                     (GROUP_ID.search(b).group(1) if GROUP_ID.search(b) else "?"), m)),
                 lambda *_: None,
                 voice_mode=a.voice_mode, voice_cards=voice_cards)
+            if script_text is not None:
+                gid_now = (GROUP_ID.search(b).group(1) if GROUP_ID.search(b) else "?")
+                check_against_script(
+                    script_text, info["dialogue"],
+                    lambda m: local_err.append("[%s] %s" % (gid_now, m)),
+                    lambda m: local_warn.append("[%s] %s" % (gid_now, m)))
             err.extend(local_err)
             warn_all.extend(local_warn)
             rows.append(info)
@@ -525,11 +592,11 @@ def main():
 
     print("")
     if err:
-        print("❌ 错误 %d 条：" % len(err))
+        print("❌ BLOCK：%d 条结构错误：" % len(err))
         for e in err:
             print("   - %s" % e)
     else:
-        print("✅ 结构门全部通过")
+        print("✅ 结构门全部通过（PASS）")
     if warn_all:
         print("⚠️ 提醒 %d 条：" % len(warn_all))
         for w in warn_all:
@@ -542,7 +609,7 @@ def main():
         print("结果已存：%s" % a.json)
 
     if err:
-        return 1
+        return 2
     if warn_all and a.strict:
         return 1
     return 0

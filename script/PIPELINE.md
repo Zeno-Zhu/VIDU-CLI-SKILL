@@ -141,7 +141,7 @@
 | B1d | 爽点表里有没有连续 3 集以上的真空？ | 补 minor，或把后面 major 前移 |
 | B1e | 大爆点落在哪一集？它是 B10（§3.16）说的"峰值"吗？ | 没定就是没拍板 |
 
-**机检**：`node script/scripts/ir-outline.mjs validate outline.json --stage beats`
+**机检**：`node "{skillDir}/script/scripts/ir-outline.mjs" validate outline.json --stage beats`
 
 **⛔ 停下拍板三件事**：砍了哪条线 / 合了哪些人 / 大爆点第几集。
 
@@ -218,11 +218,11 @@
 | C10 | 十种 AI 味逐条扫过，命中几条？（命中数写在交付说明） | 命中 ≥2 ⇒ 重写这几句 |
 | C11 | 高值节点有没有被自己写温了？（该爆的地方爆了吗） | 回 §3.8，把强度提回去 |
 
-**机检**：`node script/scripts/ir-script.mjs validate script.json --outline outline.json`（12 门）
+**机检**：`node "{skillDir}/script/scripts/ir-script.mjs" validate script.json --outline outline.json`（12 门）
 
 ```bash
 # 时长账（写超写欠都在这看）
-node script/scripts/ir-script.mjs stats script.json
+node "{skillDir}/script/scripts/ir-script.mjs" stats script.json
 ```
 
 ---
@@ -234,11 +234,11 @@ node script/scripts/ir-script.mjs stats script.json
 **写**
 
 ```bash
-node script/scripts/ir-script.mjs  render script.json --docx 剧名-剧本.docx --outline outline.json   # 主交付
-node script/scripts/ir-script.mjs  render script.json --md   --outline outline.json > 剧名-剧本.md
-node script/scripts/ir-script.mjs  render script.json --shots --outline outline.json > 剧名-shots.json
-node script/scripts/ir-outline.mjs render outline.json --docx 剧名-大纲.docx
-node script/scripts/ir-outline.mjs assets outline.json > 剧名-资产清单.md
+node "{skillDir}/script/scripts/ir-script.mjs"  render script.json --docx 剧名-剧本.docx --outline outline.json   # 主交付
+node "{skillDir}/script/scripts/ir-script.mjs"  render script.json --md   --outline outline.json > 剧名-剧本.md
+node "{skillDir}/script/scripts/ir-script.mjs"  render script.json --shots --outline outline.json > 剧名-shots.json
+node "{skillDir}/script/scripts/ir-outline.mjs" render outline.json --docx 剧名-大纲.docx
+node "{skillDir}/script/scripts/ir-outline.mjs" assets outline.json > 剧名-资产清单.md
 ```
 
 **心法自检（终审五问，书面回答）**
@@ -271,7 +271,7 @@ node script/scripts/ir-outline.mjs assets outline.json > 剧名-资产清单.md
 | P4 | 分集拆分 | `剧本拆分/第N集.md` + `分集清单.json` | **无脚本** |
 | P5 | 角色对白频次 | `角色对白频次分析.md` | **无脚本** |
 
-**出口**：`带时长剧本` → `../references/剧本到分镜的交接.md`。
+**出口**：`带时长剧本` → `{skillDir}/references/剧本到分镜的交接.md`。
 ⛔ **P 线产物不是 `script.json`**，下游分镜读不了它 —— 走这条路要接受"手工对接"。
 
 ---

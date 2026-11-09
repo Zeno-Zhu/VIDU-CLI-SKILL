@@ -177,7 +177,7 @@ node {baseDir}/scripts/ir-script.mjs render script.json --md --outline outline.j
 node {baseDir}/scripts/ir-script.mjs render script.json --shots --outline outline.json > 剧名-shots.json
 ```
 
-**最终交付是 `.docx`。** 生成器在 `scripts/docx.mjs`，零依赖（自己拼 ZIP + OOXML）。
+**最终交付是 `.docx`。** 生成器在 `{baseDir}/scripts/docx.mjs`，零依赖（自己拼 ZIP + OOXML）。
 
 Word 排版：文档标题 20pt 居中、集标题黑体 16pt 居中、场景头 12pt 加粗、△ 与对白首行缩进两字、1.5 倍行距、A4（11906×16838 twips，页边距 1440）。
 

@@ -3,7 +3,7 @@
 """建一条片子的项目骨架（资产管理目录）。
 
 一条片子的图、音、成片会散在几十个地方，手工建文件夹迟早漏。
-这条命令一次把整棵树建好，并把盘点表、映射表、资产名播报器一起放进去。
+这条命令一次把整棵树建好，并落一份空的 资产清单.json。
 
 用法：
     python scripts/asset_init.py 我的项目
@@ -27,8 +27,6 @@ import sys
 
 PROJECT_ROOT_DIR = "AI视频项目/剧情电商"
 
-POINTS_TSV = "类型\t名字\t文件名\t有没有\t父系\t用途\n"
-
 GETNAME_BAT = r"""@echo off
 setlocal enabledelayedexpansion
 :: 列出本目录下所有资产名（不含后缀），用来核对盘点表
@@ -50,14 +48,6 @@ echo ==============================================
 pause >nul
 endlocal
 """
-
-ASSET_MAP = {
-    "schema_version": "1.0.0",
-    "project": "",
-    "created_at": "",
-    "dest": "01_资产库",
-    "assets": [],
-}
 
 README_MD = """# {name}
 
@@ -83,9 +73,8 @@ README_MD = """# {name}
 
 - 图片放进 `01_资产库/`
 - 提示词存进 `00_剧本与提示词/_资产提示词/<资产名>.txt`
-- `_盘点.tsv` 补一行
-- `_资产映射.json` 补一条
-- 双击 `01_资产库/getname.bat`，列出全部资产名，跟盘点表对一遍
+- `资产清单.json` 补一条（id / name / file / status）
+- 跑 `python scripts/assets_check.py --file "00_剧本与提示词/资产清单.json"`
 
 ## 下一步
 
@@ -160,8 +149,7 @@ def main():
     ]
     for i in range(1, eps + 1):
         dirs.append("02_分集工程/EP%02d/视频" % i)
-        if i == 1:
-            dirs.append("00_剧本与提示词/EP01/分镜组")
+        dirs.append("00_剧本与提示词/EP%02d/分镜组" % i)
 
     print("项目：%s" % proj)
     print("父目录：%s%s" % (root, "（C 盘，已确认）" if on_c_drive(proj) else ""))
@@ -177,18 +165,14 @@ def main():
         os.makedirs(os.path.join(proj, d), exist_ok=True)
 
     acts = []
-    acts.append(("01_资产库/_盘点.tsv",
-                 write_if(os.path.join(proj, "01_资产库/_盘点.tsv"), POINTS_TSV, a.force)))
     acts.append(("01_资产库/getname.bat",
                  write_if(os.path.join(proj, "01_资产库/getname.bat"), GETNAME_BAT, a.force,
                           newline="\r\n")))
 
-    amap = dict(ASSET_MAP)
-    amap["project"] = name
-    amap["created_at"] = datetime.datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
-    acts.append(("00_剧本与提示词/_资产映射.json",
-                 write_if(os.path.join(proj, "00_剧本与提示词/_资产映射.json"),
-                          json.dumps(amap, ensure_ascii=False, indent=2), a.force)))
+    inv = {"schema_version": "3.0", "style": {"main": "", "texture": []}, "assets": []}
+    acts.append(("00_剧本与提示词/资产清单.json",
+                 write_if(os.path.join(proj, "00_剧本与提示词/资产清单.json"),
+                          json.dumps(inv, ensure_ascii=False, indent=2), a.force)))
 
     acts.append(("_项目说明.md",
                  write_if(os.path.join(proj, "_项目说明.md"), README_MD.format(name=name), a.force)))
